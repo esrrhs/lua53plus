@@ -587,7 +587,7 @@ LUA_API int lua_pushthread (lua_State *L) {
 static int auxgetstr (lua_State *L, const TValue *t, const char *k) {
   const TValue *slot;
   TString *str = luaS_new(L, k);
-  if (luaV_fastget(L, t, str, slot, luaH_getstr)) {
+  if (luaV_fastget(L, t, str, slot, luaH_fastgetstr)) {
     setobj2s(L, L->top, slot);
     api_incr_top(L);
   }
@@ -648,7 +648,7 @@ LUA_API int lua_rawget (lua_State *L, int idx) {
   lua_lock(L);
   t = index2addr(L, idx);
   api_check(L, ttistable(t), "table expected");
-  setobj2s(L, L->top - 1, luaH_get(hvalue(t), L->top - 1));
+  setobj2s(L, L->top - 1, luaH_fastget(hvalue(t), L->top - 1));
   lua_unlock(L);
   return ttnov(L->top - 1);
 }
@@ -743,7 +743,7 @@ static void auxsetstr (lua_State *L, const TValue *t, const char *k) {
   const TValue *slot;
   TString *str = luaS_new(L, k);
   api_checknelems(L, 1);
-  if (luaV_fastset(L, t, str, slot, luaH_getstr, L->top - 1))
+  if (luaV_fastset(L, t, str, slot, luaH_fastgetstr, L->top - 1))
     L->top--;  /* pop value */
   else {
     setsvalue2s(L, L->top, str);  /* push 'str' (to make it a TValue) */
@@ -807,6 +807,8 @@ LUA_API void lua_rawset (lua_State *L, int idx) {
   slot = luaH_set(L, hvalue(o), L->top - 2);
   setobj2t(L, slot, L->top - 1);
   invalidateTMcache(hvalue(o));
+  if (ttisshrstring(L->top - 2) && tsvalue(L->top - 2) == G(L)->tmname[TM_MODE])
+    G(L)->needmajor = 1;
   luaC_barrierback(L, hvalue(o), L->top-1);
   L->top -= 2;
   lua_unlock(L);
@@ -858,6 +860,8 @@ LUA_API int lua_setmetatable (lua_State *L, int objindex) {
     case LUA_TTABLE: {
       hvalue(obj)->metatable = mt;
       if (mt) {
+        if (isold(gcvalue(obj)) && gfasttm(G(L), mt, TM_MODE) != NULL)
+          G(L)->needmajor = 1;
         luaC_objbarrier(L, gcvalue(obj), mt);
         luaC_checkfinalizer(L, gcvalue(obj), mt);
       }
@@ -1041,6 +1045,9 @@ LUA_API int lua_gc (lua_State *L, int what, int data) {
   global_State *g;
   lua_lock(L);
   g = G(L);
+#if defined(LUA_DEBUG)
+  luaC_cleartestgray(g);
+#endif
   switch (what) {
     case LUA_GCSTOP: {
       g->gcrunning = 0;

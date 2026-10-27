@@ -10,7 +10,13 @@
 #include "lprefix.h"
 
 
+#include <stdlib.h>
 #include <string.h>
+
+#if defined(LUA_USE_POSIX) && !defined(LUA_USE_C89)
+#include <pthread.h>
+#define LUA_HAS_ASYNCSWEEP	1
+#endif
 
 #include "lua.h"
 
@@ -91,7 +97,190 @@
 */
 #define markobjectN(g,t)	{ if (t) markobject(g,t); }
 
+#define GCREMBUF_MAX	(sizeof(((global_State *)0)->rembuf) / sizeof(GCObject *))
+
 static void reallymarkobject (global_State *g, GCObject *o);
+
+
+/*
+** {======================================================
+** Optional Concurrent Background Sweep Worker (POSIX)
+** =======================================================
+*/
+
+#if defined(LUA_HAS_ASYNCSWEEP)
+
+#define ASYNC_BATCH_CAP	4096
+
+typedef struct AsyncFreeItem {
+  void *ptr;
+  size_t osize;
+} AsyncFreeItem;
+
+typedef struct AsyncSweepCtx {
+  pthread_t thread;
+  pthread_mutex_t mtx;
+  pthread_cond_t cv_work;
+  pthread_cond_t cv_done;
+  lua_Alloc frealloc;
+  void *ud;
+  AsyncFreeItem *queue;
+  size_t head;
+  size_t tail;
+  size_t count;
+  size_t cap;
+  size_t nstaging;
+  int busy;
+  int stop;
+  AsyncFreeItem staging[256];
+} AsyncSweepCtx;
+
+static void *asyncsweep_worker (void *arg) {
+  AsyncSweepCtx *ctx = cast(AsyncSweepCtx *, arg);
+  AsyncFreeItem local[256];
+  pthread_mutex_lock(&ctx->mtx);
+  for (;;) {
+    while (ctx->count == 0 && !ctx->stop)
+      pthread_cond_wait(&ctx->cv_work, &ctx->mtx);
+    if (ctx->count == 0 && ctx->stop)
+      break;
+    while (ctx->count > 0) {
+      size_t n = 0;
+      while (ctx->count > 0 && n < 256) {
+        local[n++] = ctx->queue[ctx->head];
+        ctx->head = (ctx->head + 1) & (ctx->cap - 1);
+        ctx->count--;
+      }
+      ctx->busy = 1;
+      pthread_mutex_unlock(&ctx->mtx);
+      {
+        size_t i;
+        for (i = 0; i < n; i++)
+          (*ctx->frealloc)(ctx->ud, local[i].ptr, local[i].osize, 0);
+      }
+      pthread_mutex_lock(&ctx->mtx);
+      ctx->busy = 0;
+    }
+    pthread_cond_broadcast(&ctx->cv_done);
+  }
+  pthread_mutex_unlock(&ctx->mtx);
+  return NULL;
+}
+
+static AsyncSweepCtx *asyncsweep_get (global_State *g) {
+  if (g->asyncsweep == NULL) {
+    const char *env = getenv("LUA_ASYNC_SWEEP");
+    if (env != NULL && env[0] == '1') {
+      AsyncSweepCtx *ctx = cast(AsyncSweepCtx *, malloc(sizeof(AsyncSweepCtx)));
+      if (ctx != NULL) {
+        ctx->cap = ASYNC_BATCH_CAP;
+        ctx->queue = cast(AsyncFreeItem *, malloc(sizeof(AsyncFreeItem) * ctx->cap));
+        if (ctx->queue == NULL) {
+          free(ctx);
+          g->asyncsweep = cast(void *, ~(size_t)0);
+          return NULL;
+        }
+        ctx->head = ctx->tail = ctx->count = ctx->nstaging = 0;
+        ctx->busy = ctx->stop = 0;
+        ctx->frealloc = g->frealloc;
+        ctx->ud = g->ud;
+        pthread_mutex_init(&ctx->mtx, NULL);
+        pthread_cond_init(&ctx->cv_work, NULL);
+        pthread_cond_init(&ctx->cv_done, NULL);
+        if (pthread_create(&ctx->thread, NULL, asyncsweep_worker, ctx) != 0) {
+          pthread_mutex_destroy(&ctx->mtx);
+          pthread_cond_destroy(&ctx->cv_work);
+          pthread_cond_destroy(&ctx->cv_done);
+          free(ctx->queue);
+          free(ctx);
+          g->asyncsweep = cast(void *, ~(size_t)0);
+          return NULL;
+        }
+        g->asyncsweep = ctx;
+        return ctx;
+      }
+    }
+    g->asyncsweep = cast(void *, ~(size_t)0);
+    return NULL;
+  }
+  else if (g->asyncsweep == cast(void *, ~(size_t)0))
+    return NULL;
+  else
+    return cast(AsyncSweepCtx *, g->asyncsweep);
+}
+
+static void asyncsweep_flush_staging (global_State *g, AsyncSweepCtx *ctx) {
+  size_t n = ctx->nstaging;
+  size_t i = 0;
+  if (n == 0) return;
+  ctx->nstaging = 0;
+  pthread_mutex_lock(&ctx->mtx);
+  while (i < n && ctx->count < ctx->cap) {
+    ctx->queue[ctx->tail] = ctx->staging[i++];
+    ctx->tail = (ctx->tail + 1) & (ctx->cap - 1);
+    ctx->count++;
+  }
+  if (ctx->count > 0)
+    pthread_cond_signal(&ctx->cv_work);
+  pthread_mutex_unlock(&ctx->mtx);
+  while (i < n) {
+    (*g->frealloc)(g->ud, ctx->staging[i].ptr, ctx->staging[i].osize, 0);
+    i++;
+  }
+}
+
+static void asyncsweep_push (global_State *g, AsyncSweepCtx *ctx,
+                             void *ptr, size_t osize) {
+  if (ptr == NULL) return;
+  g->GCdebt -= cast(l_mem, osize);
+  ctx->staging[ctx->nstaging].ptr = ptr;
+  ctx->staging[ctx->nstaging].osize = osize;
+  if (++ctx->nstaging == 256)
+    asyncsweep_flush_staging(g, ctx);
+}
+
+static void asyncsweep_flush (global_State *g) {
+  AsyncSweepCtx *ctx;
+  if (g->asyncsweep == NULL || g->asyncsweep == cast(void *, ~(size_t)0))
+    return;
+  ctx = cast(AsyncSweepCtx *, g->asyncsweep);
+  asyncsweep_flush_staging(g, ctx);
+  pthread_mutex_lock(&ctx->mtx);
+  if (ctx->count > 0)
+    pthread_cond_signal(&ctx->cv_work);
+  while (ctx->count > 0 || ctx->busy)
+    pthread_cond_wait(&ctx->cv_done, &ctx->mtx);
+  pthread_mutex_unlock(&ctx->mtx);
+}
+
+static void asyncsweep_shutdown (global_State *g) {
+  AsyncSweepCtx *ctx;
+  if (g->asyncsweep == NULL || g->asyncsweep == cast(void *, ~(size_t)0)) {
+    g->asyncsweep = NULL;
+    return;
+  }
+  ctx = cast(AsyncSweepCtx *, g->asyncsweep);
+  pthread_mutex_lock(&ctx->mtx);
+  ctx->stop = 1;
+  pthread_cond_signal(&ctx->cv_work);
+  pthread_mutex_unlock(&ctx->mtx);
+  pthread_join(ctx->thread, NULL);
+  pthread_mutex_destroy(&ctx->mtx);
+  pthread_cond_destroy(&ctx->cv_work);
+  pthread_cond_destroy(&ctx->cv_done);
+  free(ctx->queue);
+  free(ctx);
+  g->asyncsweep = NULL;
+}
+
+#else
+
+#define asyncsweep_flush(g)	((void)0)
+#define asyncsweep_shutdown(g)	((void)0)
+
+#endif
+
+/* }====================================================== */
 
 
 /*
@@ -111,6 +300,18 @@ static void reallymarkobject (global_State *g, GCObject *o);
 ** link collectable object 'o' into list pointed by 'p'
 */
 #define linkgclist(o,p)	((o)->gclist = (p), (p) = obj2gco(o))
+
+
+static GCObject **getgclist (GCObject *o) {
+  switch (o->tt) {
+    case LUA_TTABLE: return &gco2t(o)->gclist;
+    case LUA_TLCL: return &gco2lcl(o)->gclist;
+    case LUA_TCCL: return &gco2ccl(o)->gclist;
+    case LUA_TTHREAD: return &gco2th(o)->gclist;
+    case LUA_TPROTO: return &gco2p(o)->gclist;
+    default: lua_assert(0); return NULL;
+  }
+}
 
 
 /*
@@ -157,9 +358,25 @@ void luaC_barrier_ (lua_State *L, GCObject *o, GCObject *v) {
   lua_assert(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o));
   if (keepinvariant(g))  /* must keep invariant? */
     reallymarkobject(g, v);  /* restore invariant */
-  else {  /* sweep phase */
+  else if (g->tobeswept == NULL && !isold(o) && !tofinalize(o)) {
+    /* non-promoting sweep phase (e.g. fullgc or stopped manual sweep) */
     lua_assert(issweepphase(g));
     makewhite(g, o);  /* mark main obj. as white to avoid other barriers */
+  }
+  else if (o->tt == LUA_TTABLE || o->tt == LUA_TLCL ||
+           o->tt == LUA_TCCL || o->tt == LUA_TPROTO) {
+    /* object has gclist: move backward to grayagain so all further writes
+       are free and 'o' is re-traversed in the next cycle */
+    black2gray(o);
+    l_setbit(o->marked, TOUCHEDBIT);
+    *getgclist(o) = g->grayagain;
+    g->grayagain = o;
+  }
+  else {  /* userdata in old/promoting sweep/callfin/pause phase */
+    if (g->nrembuf < GCREMBUF_MAX)
+      g->rembuf[g->nrembuf++] = v;
+    else
+      g->needmajor = 1;
   }
 }
 
@@ -172,6 +389,7 @@ void luaC_barrierback_ (lua_State *L, Table *t) {
   global_State *g = G(L);
   lua_assert(isblack(t) && !isdead(g, t));
   black2gray(t);  /* make table gray (again) */
+  l_setbit(t->marked, TOUCHEDBIT);
   linkgclist(t, g->grayagain);
 }
 
@@ -186,8 +404,15 @@ void luaC_upvalbarrier_ (lua_State *L, UpVal *uv) {
   global_State *g = G(L);
   GCObject *o = gcvalue(uv->v);
   lua_assert(!upisopen(uv));  /* ensured by macro luaC_upvalbarrier */
-  if (keepinvariant(g))
+  if (keepinvariant(g)) {
     markobject(g, o);
+  }
+  else if (iswhite(o) && (g->oldgc != NULL || g->tobeswept != NULL)) {
+    if (g->nrembuf < GCREMBUF_MAX)
+      g->rembuf[g->nrembuf++] = o;
+    else
+      g->needmajor = 1;
+  }
 }
 
 
@@ -321,7 +546,7 @@ static void remarkupvals (global_State *g) {
       *p = thread->twups;  /* remove thread from the list */
       thread->twups = thread;  /* mark that it is out of list */
       for (uv = thread->openupval; uv != NULL; uv = uv->u.open.next) {
-        if (uv->u.open.touched) {
+        if (uv->u.open.touched || (g->oldgc != NULL && uv->refcount > 0)) {
           markvalue(g, uv->v);  /* remark upvalue's value */
           uv->u.open.touched = 0;
         }
@@ -332,15 +557,100 @@ static void remarkupvals (global_State *g) {
 
 
 /*
+** find last 'next' field in list 'p' list (to add elements in its end)
+*/
+static GCObject **findlast (GCObject **p) {
+  while (*p != NULL)
+    p = &(*p)->next;
+  return p;
+}
+
+
+/*
+** Merge all promoted old-generation objects back into 'allgc' and 'finobj'
+** as white objects before starting a major (full) collection.
+*/
+static void mergeoldgen (global_State *g) {
+  int white = luaC_white(g);
+  GCObject **p;
+  g->gray = NULL;
+  g->grayagain = NULL;
+  g->oldweak = NULL;
+  g->nrembuf = 0;
+  for (p = &g->allgc; *p != NULL; p = &(*p)->next) {
+    GCObject *curr = *p;
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  for (p = &g->oldgc; *p != NULL; p = &(*p)->next) {
+    GCObject *curr = *p;
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  *p = g->allgc;
+  g->allgc = g->oldgc;
+  g->oldgc = NULL;
+  for (p = &g->finobj; *p != NULL; p = &(*p)->next) {
+    GCObject *curr = *p;
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  for (p = &g->oldfinobj; *p != NULL; p = &(*p)->next) {
+    GCObject *curr = *p;
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  if (g->oldfinobj != NULL) {
+    *findlast(&g->finobj) = g->oldfinobj;
+    g->oldfinobj = NULL;
+  }
+  makewhite(g, g->mainthread);
+  resetbits(g->mainthread->marked, bitmask(OLDBIT) | bitmask(WEAKBIT) |
+                                   bitmask(TOUCHEDBIT) | bitmask(7));
+  g->oldcount = 0;
+  g->needmajor = 0;
+}
+
+
+/*
 ** mark root set and reset all gray lists, to start a new collection
 */
 static void restartcollection (global_State *g) {
-  g->gray = g->grayagain = NULL;
+  GCObject *o;
+  unsigned int i;
+  g->gray = g->grayagain;
+  g->grayagain = NULL;
+  for (o = g->gray; o != NULL; o = *getgclist(o)) {
+    resetbits(o->marked, bitmask(TOUCHEDBIT) | bitmask(7));
+  }
   g->weak = g->allweak = g->ephemeron = NULL;
+  makewhite(g, g->mainthread);
   markobject(g, g->mainthread);
   markvalue(g, &g->l_registry);
   markmt(g);
   markbeingfnz(g);  /* mark any finalizing object left from previous cycle */
+  /* mark surviving threads and weak tables from previous minor cycle */
+  o = g->oldweak;
+  g->oldweak = NULL;
+  while (o != NULL) {
+    GCObject *next = *getgclist(o);
+    resetbits(o->marked, bitmask(OLDBIT) | bitmask(WEAKBIT) |
+                         bitmask(TOUCHEDBIT) | bitmask(7));
+    if (iswhite(o))
+      reallymarkobject(g, o);
+    o = next;
+  }
+  /* mark remembered values from barriers outside mark phase */
+  for (i = 0; i < g->nrembuf; i++) {
+    GCObject *rem = g->rembuf[i];
+    if (iswhite(rem) && !isdead(g, rem))
+      reallymarkobject(g, rem);
+  }
+  g->nrembuf = 0;
 }
 
 /* }====================================================== */
@@ -457,6 +767,9 @@ static lu_mem traversetable (global_State *g, Table *h) {
        (weakvalue = strchr(svalue(mode), 'v')),
        (weakkey || weakvalue))) {  /* is really weak? */
     black2gray(h);  /* keep table gray */
+    l_setbit(h->marked, WEAKBIT);
+    if (isold(h))
+      g->needmajor = 1;
     if (!weakkey)  /* strong keys? */
       traverseweakvalue(g, h);
     else if (!weakvalue)  /* strong values? */
@@ -464,8 +777,10 @@ static lu_mem traversetable (global_State *g, Table *h) {
     else  /* all weak */
       linkgclist(h, g->allweak);  /* nothing to traverse now */
   }
-  else  /* not weak */
+  else {  /* not weak */
+    resetbit(h->marked, WEAKBIT);
     traversestrongtable(g, h);
+  }
   return sizeof(Table) + sizeof(TValue) * h->sizearray +
                          sizeof(Node) * cast(size_t, allocsizenode(h));
 }
@@ -478,7 +793,7 @@ static lu_mem traversetable (global_State *g, Table *h) {
 */
 static int traverseproto (global_State *g, Proto *f) {
   int i;
-  if (f->cache && iswhite(f->cache))
+  if (f->cache && (iswhite(f->cache) || isold(f)))
     f->cache = NULL;  /* allow cache to be collected */
   markobjectN(g, f->source);
   for (i = 0; i < f->sizek; i++)  /* mark literals */
@@ -560,6 +875,7 @@ static void propagatemark (global_State *g) {
   lu_mem size;
   GCObject *o = g->gray;
   lua_assert(isgray(o));
+  resetbits(o->marked, bitmask(TOUCHEDBIT) | bitmask(7));
   gray2black(o);
   switch (o->tt) {
     case LUA_TTABLE: {
@@ -583,7 +899,8 @@ static void propagatemark (global_State *g) {
     case LUA_TTHREAD: {
       lua_State *th = gco2th(o);
       g->gray = th->gclist;  /* remove from 'gray' list */
-      linkgclist(th, g->grayagain);  /* insert into 'grayagain' list */
+      if (g->gcstate != GCSinsideatomic)
+        linkgclist(th, g->grayagain);  /* insert into 'grayagain' list */
       black2gray(o);
       size = traversethread(g, th);
       break;
@@ -694,6 +1011,67 @@ static void freeLclosure (lua_State *L, LClosure *cl) {
 
 
 static void freeobj (lua_State *L, GCObject *o) {
+#if defined(LUA_HAS_ASYNCSWEEP)
+  global_State *g = G(L);
+  AsyncSweepCtx *ctx = asyncsweep_get(g);
+  if (ctx != NULL) {
+    switch (o->tt) {
+      case LUA_TPROTO: {
+        Proto *f = gco2p(o);
+        asyncsweep_push(g, ctx, f->code, sizeof(Instruction) * f->sizecode);
+        asyncsweep_push(g, ctx, f->p, sizeof(Proto *) * f->sizep);
+        asyncsweep_push(g, ctx, f->k, sizeof(TValue) * f->sizek);
+        asyncsweep_push(g, ctx, f->lineinfo, sizeof(int) * f->sizelineinfo);
+        asyncsweep_push(g, ctx, f->locvars, sizeof(LocVar) * f->sizelocvars);
+        asyncsweep_push(g, ctx, f->upvalues, sizeof(Upvaldesc) * f->sizeupvalues);
+        asyncsweep_push(g, ctx, f, sizeof(Proto));
+        return;
+      }
+      case LUA_TLCL: {
+        LClosure *cl = gco2lcl(o);
+        int i;
+        for (i = 0; i < cl->nupvalues; i++) {
+          UpVal *uv = cl->upvals[i];
+          if (uv) {
+            lua_assert(uv->refcount > 0);
+            uv->refcount--;
+            if (uv->refcount == 0 && !upisopen(uv))
+              asyncsweep_push(g, ctx, uv, sizeof(UpVal));
+          }
+        }
+        asyncsweep_push(g, ctx, cl, sizeLclosure(cl->nupvalues));
+        return;
+      }
+      case LUA_TCCL: {
+        asyncsweep_push(g, ctx, o, sizeCclosure(gco2ccl(o)->nupvalues));
+        return;
+      }
+      case LUA_TTABLE: {
+        Table *t = gco2t(o);
+        if (!isdummy(t))
+          asyncsweep_push(g, ctx, t->node, sizeof(Node) * cast(size_t, sizenode(t)));
+        if (t->array != NULL)
+          asyncsweep_push(g, ctx, t->array, sizeof(TValue) * t->sizearray);
+        asyncsweep_push(g, ctx, t, sizeof(Table));
+        return;
+      }
+      case LUA_TUSERDATA: {
+        asyncsweep_push(g, ctx, o, sizeudata(gco2u(o)));
+        return;
+      }
+      case LUA_TSHRSTR: {
+        luaS_remove(L, gco2ts(o));
+        asyncsweep_push(g, ctx, o, sizelstring(gco2ts(o)->shrlen));
+        return;
+      }
+      case LUA_TLNGSTR: {
+        asyncsweep_push(g, ctx, o, sizelstring(gco2ts(o)->u.lnglen));
+        return;
+      }
+      default: break;
+    }
+  }
+#endif
   switch (o->tt) {
     case LUA_TPROTO: luaF_freeproto(L, gco2p(o)); break;
     case LUA_TLCL: {
@@ -738,14 +1116,118 @@ static GCObject **sweeplist (lua_State *L, GCObject **p, lu_mem count) {
   while (*p != NULL && count-- > 0) {
     GCObject *curr = *p;
     int marked = curr->marked;
+    if (curr->next != NULL)
+      l_prefetch(curr->next);
     if (isdeadm(ow, marked)) {  /* is 'curr' dead? */
       *p = curr->next;  /* remove 'curr' from list */
       freeobj(L, curr);  /* erase 'curr' */
     }
     else {  /* change mark to 'white' */
-      curr->marked = cast_byte((marked & maskcolors) | white);
+      curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                     bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                     bitmask(7))) | white);
       p = &curr->next;  /* go to next element */
     }
+  }
+  return (*p == NULL) ? NULL : p;
+}
+
+
+/*
+** Sweep detached young objects ('tobeswept') in incremental mode:
+** erase dead objects and promote surviving objects into 'oldgc' (with
+** BLACKBIT | OLDBIT so subsequent minor cycles skip them in both
+** propagatemark and sweeplist). Surviving threads and weak tables stay
+** in 'allgc' and are linked into 'oldweak' via 'gclist' to be marked
+** at the start of the next minor cycle.
+*/
+static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
+  global_State *g = G(L);
+  int ow = otherwhite(g);
+  int white = luaC_white(g);
+  while (*p != NULL && count-- > 0) {
+    GCObject *curr = *p;
+    int marked = curr->marked;
+    *p = curr->next;
+    if (*p != NULL)
+      l_prefetch(*p);
+    if (isdeadm(ow, marked)) {  /* is 'curr' dead? */
+      freeobj(L, curr);  /* erase 'curr' */
+    }
+    else if (iswhite(curr)) {
+      /* 'makewhite' was called by barrier during sweep; keep as young white */
+      curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                     bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                     bitmask(7))) | white);
+      curr->next = g->allgc;
+      g->allgc = curr;
+    }
+    else if (curr->tt == LUA_TTHREAD) {
+      curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                     bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                     bitmask(7))) | white);
+      curr->next = g->allgc;
+      g->allgc = curr;
+      linkgclist(gco2th(curr), g->oldweak);
+      g->oldcount++;
+    }
+    else if (curr->tt == LUA_TTABLE && testbit(marked, WEAKBIT)) {
+      curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                     bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                     bitmask(7))) | white);
+      curr->next = g->allgc;
+      g->allgc = curr;
+      linkgclist(gco2t(curr), g->oldweak);
+      g->oldcount++;
+    }
+    else {
+      if (curr->tt == LUA_TPROTO) {
+        Proto *f = gco2p(curr);
+        if (f->cache && !isblack(f->cache))
+          f->cache = NULL;
+      }
+      if (testbit(marked, TOUCHEDBIT)) {
+        curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(BLACKBIT) |
+                       bitmask(WEAKBIT) | bitmask(7))) |
+                       bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
+      }
+      else {
+        curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(WEAKBIT) |
+                       bitmask(TOUCHEDBIT) | bitmask(7))) |
+                       bitmask(BLACKBIT) | bitmask(OLDBIT));
+      }
+      curr->next = g->oldgc;
+      g->oldgc = curr;
+      g->oldcount++;
+    }
+  }
+  return (*p == NULL) ? NULL : p;
+}
+
+
+/*
+** Sweep detached surviving finalizable objects ('tobesweptfin') in place,
+** promoting them to BLACKBIT | OLDBIT while preserving their creation order.
+*/
+static GCObject **sweepfinobj (global_State *g, GCObject **p, lu_mem count) {
+  while (*p != NULL && count-- > 0) {
+    GCObject *curr = *p;
+    int marked = curr->marked;
+    lua_assert(!isdead(g, curr));
+    if (testbit(marked, WEAKBIT))
+      g->needmajor = 1;
+    if (testbit(marked, TOUCHEDBIT)) {
+      curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(BLACKBIT) |
+                     bitmask(WEAKBIT) | bitmask(7))) |
+                     bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
+    }
+    else {
+      curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(WEAKBIT) |
+                     bitmask(TOUCHEDBIT) | bitmask(7))) |
+                     bitmask(BLACKBIT) | bitmask(OLDBIT));
+    }
+    g->oldcount++;
+    p = &curr->next;
   }
   return (*p == NULL) ? NULL : p;
 }
@@ -788,9 +1270,12 @@ static GCObject *udata2finalize (global_State *g) {
   GCObject *o = g->tobefnz;  /* get first element */
   lua_assert(tofinalize(o));
   g->tobefnz = o->next;  /* remove it from 'tobefnz' list */
+  if (g->sweepgc == &o->next)
+    g->sweepgc = &g->tobefnz;
   o->next = g->allgc;  /* return it to 'allgc' list */
   g->allgc = o;
-  resetbit(o->marked, FINALIZEDBIT);  /* object is "normal" again */
+  resetbits(o->marked, bitmask(FINALIZEDBIT) | bitmask(OLDBIT) |
+                       bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) | bitmask(7));
   if (issweepphase(g))
     makewhite(g, o);  /* "sweep" object */
   return o;
@@ -863,16 +1348,6 @@ static void callallpendingfinalizers (lua_State *L) {
 
 
 /*
-** find last 'next' field in list 'p' list (to add elements in its end)
-*/
-static GCObject **findlast (GCObject **p) {
-  while (*p != NULL)
-    p = &(*p)->next;
-  return p;
-}
-
-
-/*
 ** move all unreachable objects (or 'all' objects) that need
 ** finalization from list 'finobj' to list 'tobefnz' (to be finalized)
 */
@@ -895,8 +1370,8 @@ static void separatetobefnz (global_State *g, int all) {
 
 
 /*
-** if object 'o' has a finalizer, remove it from 'allgc' list (must
-** search the list to find it) and link it in 'finobj' list.
+** if object 'o' has a finalizer, remove it from 'allgc' (or 'oldgc' /
+** 'tobeswept') list and link it in 'finobj' (or 'oldfinobj') list.
 */
 void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
   global_State *g = G(L);
@@ -905,17 +1380,46 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
     return;  /* nothing to be done */
   else {  /* move 'o' to 'finobj' list */
     GCObject **p;
-    if (issweepphase(g)) {
-      makewhite(g, o);  /* "sweep" object 'o' */
-      if (g->sweepgc == &o->next)  /* should not remove 'sweepgc' object */
-        g->sweepgc = sweeptolive(L, g->sweepgc);  /* change 'sweepgc' */
+    if (isold(o)) {
+      for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
+      if (*p == o) {
+        *p = o->next;
+        o->next = g->oldfinobj;
+        g->oldfinobj = o;
+        l_setbit(o->marked, FINALIZEDBIT);
+        return;
+      }
     }
-    /* search for pointer pointing to 'o' */
-    for (p = &g->allgc; *p != o; p = &(*p)->next) { /* empty */ }
-    *p = o->next;  /* remove 'o' from 'allgc' list */
-    o->next = g->finobj;  /* link it in 'finobj' list */
-    g->finobj = o;
-    l_setbit(o->marked, FINALIZEDBIT);  /* mark it as such */
+    for (p = &g->allgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
+    if (*p == o) {
+      if (issweepphase(g) && g->tobeswept == NULL) {
+        makewhite(g, o);  /* "sweep" object 'o' */
+        if (g->sweepgc == &o->next)  /* should not remove 'sweepgc' object */
+          g->sweepgc = sweeptolive(L, g->sweepgc);  /* change 'sweepgc' */
+      }
+      *p = o->next;  /* remove 'o' from 'allgc' list */
+      o->next = g->finobj;  /* link it in 'finobj' list */
+      g->finobj = o;
+      l_setbit(o->marked, FINALIZEDBIT);  /* mark it as such */
+    }
+    else {
+      /* 'o' is in 'tobeswept' waiting to be promoted */
+      for (p = &g->tobeswept; *p != o; p = &(*p)->next) { /* empty */ }
+      *p = o->next;
+      if (testbit(o->marked, TOUCHEDBIT)) {
+        o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(BLACKBIT) |
+                    bitmask(WEAKBIT) | bitmask(7))) |
+                    bitmask(FINALIZEDBIT) | bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
+      }
+      else {
+        o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(WEAKBIT) |
+                    bitmask(TOUCHEDBIT) | bitmask(7))) |
+                    bitmask(FINALIZEDBIT) | bitmask(BLACKBIT) | bitmask(OLDBIT));
+      }
+      o->next = g->oldfinobj;
+      g->oldfinobj = o;
+      g->oldcount++;
+    }
   }
 }
 
@@ -944,6 +1448,13 @@ static void setpause (global_State *g) {
             ? estimate * g->gcpause  /* no overflow */
             : MAX_LMEM;  /* overflow; truncate to maximum */
   debt = gettotalbytes(g) - threshold;
+  /* When old generation is populated, ensure a reasonable minimum nursery
+     budget even when gcpause <= 100 so minor cycles don't spin with 0 debt. */
+  if (g->oldgc != NULL) {
+    l_mem minpause = cast(l_mem, g->GCestimate >> 4);
+    if (minpause > cast(l_mem, GCSTEPSIZE * 4) && debt > -minpause)
+      debt = -minpause;
+  }
   luaE_setdebt(g, debt);
 }
 
@@ -959,12 +1470,35 @@ static void entersweep (lua_State *L) {
   global_State *g = G(L);
   g->gcstate = GCSswpallgc;
   lua_assert(g->sweepgc == NULL);
-  g->sweepgc = sweeplist(L, &g->allgc, 1);
+  if (!g->infullgc && g->gcrunning) {
+    g->tobeswept = g->allgc;
+    g->allgc = NULL;
+    g->tobesweptfin = g->finobj;
+    g->finobj = NULL;
+    g->sweepgc = sweeptobeswept(L, &g->tobeswept, 1);
+  }
+  else {
+    g->sweepgc = sweeplist(L, &g->allgc, 1);
+  }
 }
 
 
 void luaC_freeallobjects (lua_State *L) {
   global_State *g = G(L);
+  asyncsweep_flush(g);
+  if (g->tobeswept != NULL) {
+    *findlast(&g->tobeswept) = g->allgc;
+    g->allgc = g->tobeswept;
+    g->tobeswept = NULL;
+  }
+  if (g->tobesweptfin != NULL) {
+    *findlast(&g->tobesweptfin) = g->oldfinobj;
+    g->oldfinobj = g->tobesweptfin;
+    g->tobesweptfin = NULL;
+  }
+  g->sweepgc = NULL;
+  g->infullgc = 1;
+  mergeoldgen(g);
   separatetobefnz(g, 1);  /* separate all objects with finalizers */
   lua_assert(g->finobj == NULL);
   callallpendingfinalizers(L);
@@ -974,6 +1508,7 @@ void luaC_freeallobjects (lua_State *L) {
   sweepwholelist(L, &g->finobj);
   sweepwholelist(L, &g->allgc);
   sweepwholelist(L, &g->fixedgc);  /* collect fixed objects */
+  asyncsweep_shutdown(g);
   lua_assert(g->strt.nuse == 0);
 }
 
@@ -983,6 +1518,7 @@ static l_mem atomic (lua_State *L) {
   l_mem work;
   GCObject *origweak, *origall;
   GCObject *grayagain = g->grayagain;  /* save original list */
+  g->grayagain = NULL;
   lua_assert(g->ephemeron == NULL && g->weak == NULL);
   lua_assert(!iswhite(g->mainthread));
   g->gcstate = GCSinsideatomic;
@@ -1018,6 +1554,16 @@ static l_mem atomic (lua_State *L) {
   /* clear values from resurrected weak tables */
   clearvalues(g, g->weak, origweak);
   clearvalues(g, g->allweak, origall);
+  /* if any old table became weak mid-cycle, restore its black mark */
+  {
+    GCObject *w;
+    for (w = g->weak; w != NULL; w = gco2t(w)->gclist)
+      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+    for (w = g->ephemeron; w != NULL; w = gco2t(w)->gclist)
+      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+    for (w = g->allweak; w != NULL; w = gco2t(w)->gclist)
+      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+  }
   luaS_clearcache(g);
   g->currentwhite = cast_byte(otherwhite(g));  /* flip current white */
   work += g->GCmemtrav;  /* complete counting */
@@ -1029,12 +1575,22 @@ static lu_mem sweepstep (lua_State *L, global_State *g,
                          int nextstate, GCObject **nextlist) {
   if (g->sweepgc) {
     l_mem olddebt = g->GCdebt;
-    g->sweepgc = sweeplist(L, g->sweepgc, GCSWEEPMAX);
+    if (g->gcstate == GCSswpallgc && g->sweepgc == &g->tobeswept)
+      g->sweepgc = sweeptobeswept(L, g->sweepgc, GCSWEEPMAX);
+    else if (g->gcstate == GCSswpfinobj && g->tobesweptfin != NULL)
+      g->sweepgc = sweepfinobj(g, g->sweepgc, GCSWEEPMAX);
+    else
+      g->sweepgc = sweeplist(L, g->sweepgc, GCSWEEPMAX);
     g->GCestimate += g->GCdebt - olddebt;  /* update estimate */
     if (g->sweepgc)  /* is there still something to sweep? */
       return (GCSWEEPMAX * GCSWEEPCOST);
   }
   /* else enter next state */
+  if (g->gcstate == GCSswpfinobj && g->tobesweptfin != NULL) {
+    *findlast(&g->tobesweptfin) = g->oldfinobj;
+    g->oldfinobj = g->tobesweptfin;
+    g->tobesweptfin = NULL;
+  }
   g->gcstate = nextstate;
   g->sweepgc = nextlist;
   return 0;
@@ -1046,6 +1602,20 @@ static lu_mem singlestep (lua_State *L) {
   switch (g->gcstate) {
     case GCSpause: {
       g->GCmemtrav = g->strt.size * sizeof(GCObject*);
+      if (g->needmajor || g->infullgc || !g->gcrunning ||
+          (gettotalbytes(g) < 512 * 1024 && g->minorcycles >= 1) ||
+          (gettotalbytes(g) < 4 * 1024 * 1024 && g->minorcycles >= 16) ||
+          (g->lastmajcount > 0 && g->oldcount > g->lastmajcount + (g->lastmajcount >> 1))) {
+        mergeoldgen(g);
+        g->ismajor = 1;
+        g->minorcycles = 0;
+      }
+      else {
+        g->ismajor = (g->oldgc == NULL && g->oldfinobj == NULL &&
+                      g->oldweak == NULL);
+        if (!g->ismajor)
+          g->minorcycles++;
+      }
       restartcollection(g);
       g->gcstate = GCSpropagate;
       return g->GCmemtrav;
@@ -1067,7 +1637,9 @@ static lu_mem singlestep (lua_State *L) {
       return work;
     }
     case GCSswpallgc: {  /* sweep "regular" objects */
-      return sweepstep(L, g, GCSswpfinobj, &g->finobj);
+      GCObject **nextlist = (g->tobesweptfin != NULL) ? &g->tobesweptfin :
+                            (!g->infullgc && g->gcrunning) ? NULL : &g->finobj;
+      return sweepstep(L, g, GCSswpfinobj, nextlist);
     }
     case GCSswpfinobj: {  /* sweep objects with finalizers */
       return sweepstep(L, g, GCSswptobefnz, &g->tobefnz);
@@ -1076,6 +1648,9 @@ static lu_mem singlestep (lua_State *L) {
       return sweepstep(L, g, GCSswpend, NULL);
     }
     case GCSswpend: {  /* finish sweeps */
+      if (g->ismajor)
+        g->lastmajcount = g->oldcount;
+      g->infullgc = 0;
       makewhite(g, g->mainthread);  /* sweep main thread */
       checkSizes(L, g);
       g->gcstate = GCScallfin;
@@ -1125,8 +1700,19 @@ static l_mem getdebt (global_State *g) {
 /*
 ** performs a basic GC step when collector is running
 */
+#if defined(LUA_DEBUG)
+void luaC_cleartestgray (global_State *g) {
+  GCObject *o;
+  for (o = g->gray; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
+  for (o = g->grayagain; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
+}
+#endif
+
 void luaC_step (lua_State *L) {
   global_State *g = G(L);
+#if defined(LUA_DEBUG)
+  luaC_cleartestgray(g);
+#endif
   l_mem debt = getdebt(g);  /* GC deficit (be paid now) */
   if (!g->gcrunning) {  /* not running? */
     luaE_setdebt(g, -GCSTEPSIZE * 10);  /* avoid being called too often */
@@ -1160,12 +1746,17 @@ void luaC_fullgc (lua_State *L, int isemergency) {
   lua_assert(g->gckind == KGC_NORMAL);
   if (isemergency) g->gckind = KGC_EMERGENCY;  /* set flag */
   if (keepinvariant(g)) {  /* black objects? */
+    g->infullgc = 1;
     entersweep(L); /* sweep everything to turn them back to white */
   }
   /* finish any pending sweep phase to start a new cycle */
   luaC_runtilstate(L, bitmask(GCSpause));
+  g->infullgc = isemergency ? 1 : 0;
+  mergeoldgen(g);
   luaC_runtilstate(L, ~bitmask(GCSpause));  /* start new collection */
   luaC_runtilstate(L, bitmask(GCScallfin));  /* run up to finalizers */
+  g->infullgc = 0;
+  asyncsweep_flush(g);
   /* estimate must be correct after a full GC cycle */
   lua_assert(g->GCestimate == gettotalbytes(g));
   luaC_runtilstate(L, bitmask(GCSpause));  /* finish collection */
@@ -1174,5 +1765,3 @@ void luaC_fullgc (lua_State *L, int isemergency) {
 }
 
 /* }====================================================== */
-
-

@@ -1,0 +1,8 @@
+*.o
+*.a
+*.so
+*.dylib
+src/lua
+src/luac
+src/liblua.a
+luac.out

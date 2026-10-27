@@ -79,7 +79,12 @@
 #define WHITE1BIT	1  /* object is white (type 1) */
 #define BLACKBIT	2  /* object is black */
 #define FINALIZEDBIT	3  /* object has been marked for finalization */
+#define OLDBIT		4  /* object is in old generation */
+#define WEAKBIT		5  /* table was marked as weak in current cycle */
+#define TOUCHEDBIT	6  /* old object was touched by write barrier */
 /* bit 7 is currently used by tests (luaL_checkmemory) */
+
+#define isold(x)	testbit((x)->marked, OLDBIT)
 
 #define WHITEBITS	bit2mask(WHITE0BIT, WHITE1BIT)
 
@@ -142,6 +147,9 @@ LUAI_FUNC void luaC_barrierback_ (lua_State *L, Table *o);
 LUAI_FUNC void luaC_upvalbarrier_ (lua_State *L, UpVal *uv);
 LUAI_FUNC void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt);
 LUAI_FUNC void luaC_upvdeccount (lua_State *L, UpVal *uv);
+#if defined(LUA_DEBUG)
+LUAI_FUNC void luaC_cleartestgray (global_State *g);
+#endif
 
 
 #endif

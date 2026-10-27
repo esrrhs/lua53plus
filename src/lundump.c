@@ -17,6 +17,7 @@
 #include "ldebug.h"
 #include "ldo.h"
 #include "lfunc.h"
+#include "lgc.h"
 #include "lmem.h"
 #include "lobject.h"
 #include "lstring.h"
@@ -141,6 +142,7 @@ static void LoadConstants (LoadState *S, Proto *f) {
     case LUA_TSHRSTR:
     case LUA_TLNGSTR:
       setsvalue2n(S->L, o, LoadString(S));
+      luaC_barrier(S->L, f, o);
       break;
     default:
       lua_assert(0);
@@ -158,6 +160,7 @@ static void LoadProtos (LoadState *S, Proto *f) {
     f->p[i] = NULL;
   for (i = 0; i < n; i++) {
     f->p[i] = luaF_newproto(S->L);
+    luaC_objbarrier(S->L, f, f->p[i]);
     LoadFunction(S, f->p[i], f->source);
   }
 }
@@ -190,12 +193,15 @@ static void LoadDebug (LoadState *S, Proto *f) {
     f->locvars[i].varname = NULL;
   for (i = 0; i < n; i++) {
     f->locvars[i].varname = LoadString(S);
+    luaC_objbarrier(S->L, f, f->locvars[i].varname);
     f->locvars[i].startpc = LoadInt(S);
     f->locvars[i].endpc = LoadInt(S);
   }
   n = LoadInt(S);
-  for (i = 0; i < n; i++)
+  for (i = 0; i < n; i++) {
     f->upvalues[i].name = LoadString(S);
+    luaC_objbarrier(S->L, f, f->upvalues[i].name);
+  }
 }
 
 
@@ -203,6 +209,7 @@ static void LoadFunction (LoadState *S, Proto *f, TString *psource) {
   f->source = LoadString(S);
   if (f->source == NULL)  /* no source in dump? */
     f->source = psource;  /* reuse parent's source */
+  luaC_objbarrier(S->L, f, f->source);
   f->linedefined = LoadInt(S);
   f->lastlinedefined = LoadInt(S);
   f->numparams = LoadByte(S);
@@ -271,6 +278,7 @@ LClosure *luaU_undump(lua_State *L, ZIO *Z, const char *name) {
   setclLvalue(L, L->top, cl);
   luaD_inctop(L);
   cl->p = luaF_newproto(L);
+  luaC_objbarrier(L, cl, cl->p);
   LoadFunction(&S, cl->p, NULL);
   lua_assert(cl->nupvalues == cl->p->sizeupvalues);
   luai_verifycode(L, buff, cl->p);

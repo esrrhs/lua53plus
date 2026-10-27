@@ -11,6 +11,7 @@
 #include "ldo.h"
 #include "lobject.h"
 #include "ltm.h"
+#include "ltable.h"
 
 
 #if !defined(LUA_NOCVTN2S)
@@ -65,7 +66,7 @@
 ** standard implementation for 'gettable'
 */
 #define luaV_gettable(L,t,k,v) { const TValue *slot; \
-  if (luaV_fastget(L,t,k,slot,luaH_get)) { setobj2s(L, v, slot); } \
+  if (luaV_fastget(L,t,k,slot,luaH_fastget)) { setobj2s(L, v, slot); } \
   else luaV_finishget(L,t,k,v,slot); }
 
 
@@ -88,7 +89,7 @@
 
 
 #define luaV_settable(L,t,k,v) { const TValue *slot; \
-  if (!luaV_fastset(L,t,k,slot,luaH_get,v)) \
+  if (!luaV_fastset(L,t,k,slot,luaH_fastget,v)) \
     luaV_finishset(L,t,k,v,slot); }
 
 

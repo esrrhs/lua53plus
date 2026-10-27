@@ -61,7 +61,13 @@
 #if defined(LUA_USE_LINUX)
 #define LUA_USE_POSIX
 #define LUA_USE_DLOPEN		/* needs an extra library: -ldl */
+#if defined(__has_include)
+#if __has_include(<readline/readline.h>)
 #define LUA_USE_READLINE	/* needs some extra libraries */
+#endif
+#else
+#define LUA_USE_READLINE	/* needs some extra libraries */
+#endif
 #endif
 
 

@@ -151,6 +151,20 @@ typedef struct global_State {
   TString *tmname[TM_N];  /* array with tag-method names */
   struct Table *mt[LUA_NUMTAGS];  /* metatables for basic types */
   TString *strcache[STRCACHE_N][STRCACHE_M];  /* cache for strings in API */
+  GCObject *oldgc;  /* list of promoted old objects */
+  GCObject *oldfinobj;  /* list of promoted old finalizable objects */
+  GCObject *oldweak;  /* gclist of surviving threads and weak tables */
+  GCObject *tobeswept;  /* young objects to be swept in current cycle */
+  GCObject *tobesweptfin;  /* young finobj to be swept in current cycle */
+  GCObject *rembuf[64];  /* remembered objects from barriers outside mark */
+  unsigned int nrembuf;  /* number of items in 'rembuf' */
+  unsigned int minorcycles;  /* consecutive minor cycles since last major GC */
+  lu_mem oldcount;  /* number of promoted objects in old generation */
+  lu_mem lastmajcount;  /* 'oldcount' after last major GC */
+  lu_byte ismajor;  /* true if current cycle is a major GC */
+  lu_byte needmajor;  /* true if next cycle must be a major GC */
+  lu_byte infullgc;  /* true if inside luaC_fullgc */
+  void *asyncsweep;  /* optional background sweep worker context */
 } global_State;
 
 

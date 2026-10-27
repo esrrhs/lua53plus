@@ -183,7 +183,7 @@ void luaV_finishget (lua_State *L, const TValue *t, TValue *key, StkId val,
       return;
     }
     t = tm;  /* else try to access 'tm[key]' */
-    if (luaV_fastget(L,t,key,slot,luaH_get)) {  /* fast track? */
+    if (luaV_fastget(L,t,key,slot,luaH_fastget)) {  /* fast track? */
       setobj2s(L, val, slot);  /* done */
       return;
     }
@@ -215,6 +215,8 @@ void luaV_finishset (lua_State *L, const TValue *t, TValue *key,
         /* no metamethod and (now) there is an entry with given key */
         setobj2t(L, cast(TValue *, slot), val);  /* set its new value */
         invalidateTMcache(h);
+        if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE])
+          G(L)->needmajor = 1;
         luaC_barrierback(L, h, val);
         return;
       }
@@ -230,7 +232,7 @@ void luaV_finishset (lua_State *L, const TValue *t, TValue *key,
       return;
     }
     t = tm;  /* else repeat assignment over 'tm' */
-    if (luaV_fastset(L, t, key, slot, luaH_get, val))
+    if (luaV_fastset(L, t, key, slot, luaH_fastget, val))
       return;  /* done */
     /* else loop */
   }
@@ -647,6 +649,10 @@ static void pushclosure (lua_State *L, Proto *p, UpVal **encup, StkId base,
   }
   if (!isblack(p))  /* cache will not break GC invariant? */
     p->cache = ncl;  /* save it on cache for reuse */
+  else if (isold(p)) {
+    p->cache = ncl;  /* save it on cache and schedule proto re-check */
+    luaC_objbarrier(L, p, ncl);
+  }
 }
 
 
@@ -772,13 +778,13 @@ void luaV_finishOp (lua_State *L) {
 ** metamethod (which can reallocate the stack)
 */
 #define gettableProtected(L,t,k,v)  { const TValue *slot; \
-  if (luaV_fastget(L,t,k,slot,luaH_get)) { setobj2s(L, v, slot); } \
+  if (luaV_fastget(L,t,k,slot,luaH_fastget)) { setobj2s(L, v, slot); } \
   else Protect(luaV_finishget(L,t,k,v,slot)); }
 
 
 /* same for 'luaV_settable' */
 #define settableProtected(L,t,k,v) { const TValue *slot; \
-  if (!luaV_fastset(L,t,k,slot,luaH_get,v)) \
+  if (!luaV_fastset(L,t,k,slot,luaH_fastget,v)) \
     Protect(luaV_finishset(L,t,k,v,slot)); }
 
 
@@ -880,7 +886,7 @@ void luaV_execute (lua_State *L) {
         TValue *rc = RKC(i);
         TString *key = tsvalue(rc);  /* key must be a string */
         setobjs2s(L, ra + 1, rb);
-        if (luaV_fastget(L, rb, key, aux, luaH_getstr)) {
+        if (luaV_fastget(L, rb, key, aux, luaH_fastgetstr)) {
           setobj2s(L, ra, aux);
         }
         else Protect(luaV_finishget(L, rb, rc, ra, aux));

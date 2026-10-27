@@ -143,6 +143,33 @@ typedef LUAI_UACINT l_uacInt;
 #define l_noret		void
 #endif
 
+/*
+** inline, branch prediction, and software prefetch hints
+*/
+#if !defined(l_inline)
+#if defined(__GNUC__) && !defined(__STRICT_ANSI__)
+#define l_inline	__inline__ __attribute__((always_inline, unused))
+#elif defined(__GNUC__)
+#define l_inline	__inline__ __attribute__((unused))
+#elif defined(_MSC_VER)
+#define l_inline	__forceinline
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#define l_inline	inline
+#else
+#define l_inline
+#endif
+#endif
+
+#if defined(__GNUC__)
+#define l_likely(x)	(__builtin_expect(((x) != 0), 1))
+#define l_unlikely(x)	(__builtin_expect(((x) != 0), 0))
+#define l_prefetch(p)	__builtin_prefetch((p), 0, 1)
+#else
+#define l_likely(x)	(x)
+#define l_unlikely(x)	(x)
+#define l_prefetch(p)	((void)0)
+#endif
+
 
 
 /*

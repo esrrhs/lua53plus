@@ -55,11 +55,7 @@
 #define MAXHBITS	(MAXABITS - 1)
 
 
-#define hashpow2(t,n)		(gnode(t, lmod((n), sizenode(t))))
-
-#define hashstr(t,str)		hashpow2(t, (str)->hash)
-#define hashboolean(t,p)	hashpow2(t, p)
-#define hashint(t,i)		hashpow2(t, i)
+/* hashpow2, hashstr, hashboolean, hashint defined in ltable.h */
 
 
 /*
@@ -356,8 +352,15 @@ void luaH_resize (lua_State *L, Table *t, unsigned int nasize,
     Node *old = nold + j;
     if (!ttisnil(gval(old))) {
       /* doesn't need barrier/invalidate cache, as entry was
-         already present in the table */
-      setobjt2t(L, luaH_set(L, t, gkey(old)), gval(old));
+         already present in the table. Since new hash part is fresh
+         and keys are unique, insert directly without searching first. */
+      TValue *slot;
+      if (ttisinteger(gkey(old)) &&
+          (l_castS2U(ivalue(gkey(old))) - 1u < t->sizearray))
+        slot = &t->array[ivalue(gkey(old)) - 1];
+      else
+        slot = luaH_newkey(L, t, gkey(old));
+      setobjt2t(L, slot, gval(old));
     }
   }
   if (oldhsize > 0)  /* not the dummy node? */
@@ -419,8 +422,22 @@ void luaH_free (lua_State *L, Table *t) {
 }
 
 
-static Node *getfreepos (Table *t) {
+static Node *getfreepos (Table *t, Node *mp) {
   if (!isdummy(t)) {
+    /* First probe buddy slots in the same 64B/128B cache-line neighborhood
+       so collision chains stay within the same L1/L2 cache line as 'mp'. */
+    unsigned int sz = cast(unsigned int, sizenode(t));
+    unsigned int idx = cast(unsigned int, mp - t->node);
+    if (sz > 1u) {
+      Node *b1 = gnode(t, idx ^ 1u);
+      if (ttisnil(gkey(b1))) return b1;
+      if (sz > 3u) {
+        Node *b2 = gnode(t, idx ^ 2u);
+        if (ttisnil(gkey(b2))) return b2;
+        Node *b3 = gnode(t, idx ^ 3u);
+        if (ttisnil(gkey(b3))) return b3;
+      }
+    }
     while (t->lastfree > t->node) {
       t->lastfree--;
       if (ttisnil(gkey(t->lastfree)))
@@ -455,7 +472,7 @@ TValue *luaH_newkey (lua_State *L, Table *t, const TValue *key) {
   mp = mainposition(t, key);
   if (!ttisnil(gval(mp)) || isdummy(t)) {  /* main position is taken? */
     Node *othern;
-    Node *f = getfreepos(t);  /* get a free place */
+    Node *f = getfreepos(t, mp);  /* get a cache-local free place */
     if (f == NULL) {  /* cannot find a free place? */
       rehash(L, t, key);  /* grow table */
       /* whatever called 'newkey' takes care of TM cache */
@@ -485,6 +502,8 @@ TValue *luaH_newkey (lua_State *L, Table *t, const TValue *key) {
     }
   }
   setnodekey(L, &mp->i_key, key);
+  if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE])
+    G(L)->needmajor = 1;
   luaC_barrierback(L, t, key);
   lua_assert(ttisnil(gval(mp)));
   return gval(mp);
@@ -516,20 +535,27 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
 
 /*
 ** search function for short strings
+** Unrolls the primary bucket check and compares the interned TString pointer
+** before the tag byte to minimize branch mispredictions on string tables.
 */
 const TValue *luaH_getshortstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);
+  const TValue *k = gkey(n);
   lua_assert(key->tt == LUA_TSHRSTR);
-  for (;;) {  /* check whether 'key' is somewhere in the chain */
-    const TValue *k = gkey(n);
-    if (ttisshrstring(k) && eqshrstr(tsvalue(k), key))
-      return gval(n);  /* that's it */
-    else {
-      int nx = gnext(n);
-      if (nx == 0)
-        return luaO_nilobject;  /* not found */
+  if (l_likely(val_(k).gc == obj2gco(key) && ttisshrstring(k)))
+    return gval(n);  /* hit at main position */
+  {
+    int nx = gnext(n);
+    if (nx == 0)
+      return luaO_nilobject;  /* not found */
+    do {  /* follow collision chain */
       n += nx;
-    }
+      k = gkey(n);
+      if (val_(k).gc == obj2gco(key) && l_likely(ttisshrstring(k)))
+        return gval(n);  /* that's it */
+      nx = gnext(n);
+    } while (nx != 0);
+    return luaO_nilobject;  /* not found */
   }
 }
 
@@ -554,8 +580,8 @@ static const TValue *getgeneric (Table *t, const TValue *key) {
 
 
 const TValue *luaH_getstr (Table *t, TString *key) {
-  if (key->tt == LUA_TSHRSTR)
-    return luaH_getshortstr(t, key);
+  if (l_likely(key->tt == LUA_TSHRSTR))
+    return luaH_fastgetshortstr(t, key);
   else {  /* for long strings, use generic case */
     TValue ko;
     setsvalue(cast(lua_State *, NULL), &ko, key);
@@ -569,7 +595,7 @@ const TValue *luaH_getstr (Table *t, TString *key) {
 */
 const TValue *luaH_get (Table *t, const TValue *key) {
   switch (ttype(key)) {
-    case LUA_TSHRSTR: return luaH_getshortstr(t, tsvalue(key));
+    case LUA_TSHRSTR: return luaH_fastgetshortstr(t, tsvalue(key));
     case LUA_TNUMINT: return luaH_getint(t, ivalue(key));
     case LUA_TNIL: return luaO_nilobject;
     case LUA_TNUMFLT: {
@@ -589,7 +615,7 @@ const TValue *luaH_get (Table *t, const TValue *key) {
 ** barrier and invalidate the TM cache.
 */
 TValue *luaH_set (lua_State *L, Table *t, const TValue *key) {
-  const TValue *p = luaH_get(t, key);
+  const TValue *p = luaH_fastget(t, key);
   if (p != luaO_nilobject)
     return cast(TValue *, p);
   else return luaH_newkey(L, t, key);

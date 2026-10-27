@@ -1,0 +1,107 @@
+name: CI
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build-and-test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux
+          - os: macos-latest
+            target: macosx
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build lua53plus
+        run: make ${{ matrix.target }}
+
+      - name: Verify binaries
+        run: |
+          ./src/lua -v
+          ./src/luac -v
+
+      - name: Run GC, weak table, finalizer, and table lookup sanity tests
+        run: |
+          ./src/lua -e '
+            -- 1. Old-generation promotion & write barriers
+            collectgarbage("stop")
+            local old = {}
+            for i = 1, 5000 do
+              old[i] = { id = i, name = "item_" .. i, fn = function(x) return i + x end }
+            end
+            collectgarbage("restart")
+            collectgarbage("collect")
+            for step = 1, 2000 do
+              old[(step % 5000) + 1].young = { v = step, s = "val_" .. step }
+            end
+            collectgarbage("step", 200)
+            for i = 1, 5000 do
+              assert(old[i].fn(10) == i + 10)
+            end
+
+            -- 2. Weak tables (k, v, kv) & ephemerons across minor/major cycles
+            local wk = setmetatable({}, { __mode = "k" })
+            local wv = setmetatable({}, { __mode = "v" })
+            do
+              local k = {}
+              local v = { tag = "ephemeral" }
+              wk[k] = "alive_until_gc"
+              wv["slot"] = v
+            end
+            collectgarbage("collect")
+            assert(next(wk) == nil)
+            assert(wv["slot"] == nil)
+
+            -- 3. Finalizers (__gc)
+            local finalized = 0
+            do
+              for i = 1, 100 do
+                setmetatable({ idx = i }, { __gc = function() finalized = finalized + 1 end })
+              end
+            end
+            collectgarbage("collect")
+            assert(finalized == 100)
+
+            -- 4. Closure caching & dump/undump barriers
+            local dumped = string.dump(function(a, b) return a * 10 + b end)
+            local loaded = assert(load(dumped))
+            assert(loaded(3, 4) == 34)
+            print("All sanity checks passed!")
+          '
+
+      - name: Run benchmarks (default mode)
+        env:
+          BENCH_RESIDENT_GROUPS: "20000"
+          BENCH_TICKS_DEFAULT: "100000"
+          BENCH_TICKS_LOWPAUSE: "100000"
+          BENCH_N_DIRECT: "1000000"
+          BENCH_N_LARGE: "10000"
+          BENCH_N_OOP: "500000"
+          BENCH_N_REHASH: "2000"
+          BENCH_ENTITIES: "10000"
+          BENCH_ROUNDS: "50000"
+        run: |
+          ./src/lua bench/bench_gc_largeheap.lua
+          ./src/lua bench/bench_table_lookup.lua
+          ./src/lua bench/bench_mixed_workload.lua
+
+      - name: Run benchmarks (async background sweep mode)
+        env:
+          LUA_ASYNC_SWEEP: "1"
+          BENCH_RESIDENT_GROUPS: "20000"
+          BENCH_TICKS_DEFAULT: "100000"
+          BENCH_TICKS_LOWPAUSE: "100000"
+          BENCH_ENTITIES: "10000"
+          BENCH_ROUNDS: "50000"
+        run: |
+          ./src/lua bench/bench_gc_largeheap.lua
+          ./src/lua bench/bench_mixed_workload.lua
