@@ -398,6 +398,7 @@ static void restartcollection (global_State *g);
 static void startbleach (global_State *g) {
   int white = luaC_white(g);
   GCObject *curr;
+  GCObject **p;
   g->gray = NULL;
   g->grayagain = NULL;
   g->oldweak = NULL;
@@ -407,11 +408,13 @@ static void startbleach (global_State *g) {
                    bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
                    bitmask(7))) | white);
   }
-  for (curr = g->finobj; curr != NULL; curr = curr->next) {
+  for (p = &g->finobj; *p != NULL; p = &(*p)->next) {
+    curr = *p;
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                    bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
                    bitmask(7))) | white);
   }
+  g->fintail = p;
   makewhite(g, g->mainthread);
   resetbits(g->mainthread->marked, bitmask(OLDBIT) | bitmask(WEAKBIT) |
                                    bitmask(TOUCHEDBIT) | bitmask(7));
@@ -446,12 +449,14 @@ static lu_mem bleachstep (global_State *g) {
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                    bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
                    bitmask(7))) | white);
-    curr->next = g->finobj;
-    g->finobj = curr;
+    curr->next = NULL;
+    *g->fintail = curr;
+    g->fintail = &curr->next;
     count--;
   }
   if (g->oldgc != NULL || g->oldfinobj != NULL)
     return (GCSWEEPMAX * GCSWEEPCOST);
+  g->fintail = NULL;
   g->inbleach = 0;
   g->GCmemtrav = g->strt.size * sizeof(GCObject*);
   restartcollection(g);
@@ -464,6 +469,7 @@ static void mergeoldgen (global_State *g) {
   int white = luaC_white(g);
   GCObject **p;
   g->inbleach = 0;
+  g->fintail = NULL;
   g->gray = NULL;
   g->grayagain = NULL;
   g->oldweak = NULL;
@@ -1218,6 +1224,8 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
           o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                       bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
                       bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+          if (g->finobj == NULL)
+            g->fintail = &o->next;
           o->next = g->finobj;
           g->finobj = o;
         }
@@ -1237,6 +1245,8 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
           g->sweepgc = sweeptolive(L, g->sweepgc);  /* change 'sweepgc' */
       }
       *p = o->next;  /* remove 'o' from 'allgc' list */
+      if (g->inbleach && g->finobj == NULL)
+        g->fintail = &o->next;
       o->next = g->finobj;  /* link it in 'finobj' list */
       g->finobj = o;
       l_setbit(o->marked, FINALIZEDBIT);  /* mark it as such */

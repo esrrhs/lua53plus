@@ -240,9 +240,13 @@ This produces:
 1. Replace your project's `lua-5.3.4/src` directory (or `liblua.a`) with `lua53plus/src`.
 2. Recompile — no changes to your C/C++ host code, linker flags, or Lua scripts are required.
 
-### Running Benchmarks
+### Running Tests & Benchmarks
 
 ```bash
+# Run randomized cross-generation GC & write-barrier fuzz test suite
+./src/lua tests/test_gc_fuzz.lua
+
+# Run benchmarks
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua

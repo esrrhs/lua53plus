@@ -261,9 +261,13 @@ make clean
 1. 将项目中原有的 `lua-5.3.4/src` 源码目录（或编译出的 `liblua.a`）替换为 `lua53plus/src`。
 2. 重新编译即可 —— 无需修改任何 C/C++ 宿主代码、链接参数或 Lua 脚本。
 
-### 运行基准测试
+### 运行随机交叉分代测试与基准测试
 
 ```bash
+# 运行新老年代随机交叉引用与写屏障 Fuzz 测试套件
+./src/lua tests/test_gc_fuzz.lua
+
+# 运行基准测试
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua

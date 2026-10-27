@@ -153,6 +153,7 @@ typedef struct global_State {
   TString *strcache[STRCACHE_N][STRCACHE_M];  /* cache for strings in API */
   GCObject *oldgc;  /* list of promoted old objects */
   GCObject *oldfinobj;  /* list of promoted old finalizable objects */
+  GCObject **fintail;  /* tail cursor for in-order oldfinobj bleaching */
   GCObject *oldweak;  /* gclist of surviving threads and weak tables */
   GCObject *tobeswept;  /* young objects to be swept in current cycle */
   GCObject *tobesweptfin;  /* young finobj to be swept in current cycle */

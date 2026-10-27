@@ -329,6 +329,7 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   g->gcpause = LUAI_GCPAUSE;
   g->gcstepmul = LUAI_GCMUL;
   g->oldgc = g->oldfinobj = g->oldweak = NULL;
+  g->fintail = NULL;
   g->tobeswept = g->tobesweptfin = NULL;
   g->nrembuf = 0;
   g->minorcycles = 0;
