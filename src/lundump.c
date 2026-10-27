@@ -193,14 +193,16 @@ static void LoadDebug (LoadState *S, Proto *f) {
     f->locvars[i].varname = NULL;
   for (i = 0; i < n; i++) {
     f->locvars[i].varname = LoadString(S);
-    luaC_objbarrier(S->L, f, f->locvars[i].varname);
+    if (f->locvars[i].varname != NULL)
+      luaC_objbarrier(S->L, f, f->locvars[i].varname);
     f->locvars[i].startpc = LoadInt(S);
     f->locvars[i].endpc = LoadInt(S);
   }
   n = LoadInt(S);
   for (i = 0; i < n; i++) {
     f->upvalues[i].name = LoadString(S);
-    luaC_objbarrier(S->L, f, f->upvalues[i].name);
+    if (f->upvalues[i].name != NULL)
+      luaC_objbarrier(S->L, f, f->upvalues[i].name);
   }
 }
 
@@ -209,7 +211,8 @@ static void LoadFunction (LoadState *S, Proto *f, TString *psource) {
   f->source = LoadString(S);
   if (f->source == NULL)  /* no source in dump? */
     f->source = psource;  /* reuse parent's source */
-  luaC_objbarrier(S->L, f, f->source);
+  if (f->source != NULL)
+    luaC_objbarrier(S->L, f, f->source);
   f->linedefined = LoadInt(S);
   f->lastlinedefined = LoadInt(S);
   f->numparams = LoadByte(S);

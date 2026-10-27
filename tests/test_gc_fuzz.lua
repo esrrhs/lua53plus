@@ -478,9 +478,133 @@ local function run_fuzz_round(seed, manual_gc_mode, num_ops)
   io.write(string.format("OK (finalized=%d, post_gc_kb=%.1f)\n", finalized_count, final_kb))
 end
 
+-- Regression Test 3: Edge cases across lundump, tobeswept/tobefnz barriers, and TM_HASMODE fastset
+local function test_gc_adversarial_edge_cases()
+  io.write("  [regression: stripped undump barrier, tobeswept/tobefnz barriers & TM_HASMODE fastset] ")
+  io.flush()
+
+  -- 3a. Stripped precompiled chunk with GC triggered inside lua_Reader while Proto is black & source is NULL
+  local dumped = string.dump(function(x)
+    local a = x + 1
+    return function() return a end
+  end, true)
+  for split = 28, math.min(#dumped - 1, 64) do
+    local chunk_idx = 0
+    local fn = assert(load(function()
+      chunk_idx = chunk_idx + 1
+      if chunk_idx == 1 then return dumped:sub(1, split) end
+      if chunk_idx == 2 then
+        collectgarbage("collect")
+        return dumped:sub(split + 1)
+      end
+      return nil
+    end))
+    assert(fn(41)() == 42)
+  end
+
+  -- Build >4MB resident old heap so minor cycles stay minor unless needmajor is triggered
+  local resident = {}
+  for i = 1, 80000 do resident[i] = { i, i + 1, i + 2 } end
+  collectgarbage("collect")
+
+  -- 3b. Weak table in tobeswept gets a brand-new white __gc metatable during GCSswpallgc
+  do
+    local weak_mt = { __mode = "v" }
+    local o = setmetatable({}, weak_mt)
+    local pad = {}
+    for i = 1, 2000 do pad[i] = { i } end
+    setmetatable({}, { __gc = function()
+      setmetatable(o, {
+        tag = "alive_meta_tag",
+        __gc = function() end
+      })
+    end })
+    for _ = 1, 5000 do
+      if getmetatable(o) ~= weak_mt then break end
+      collectgarbage("step", 0)
+    end
+    assert(getmetatable(o) ~= weak_mt)
+    while not collectgarbage("step", 0) do end
+    while not collectgarbage("step", 0) do end
+    assert(getmetatable(o) and getmetatable(o).tag == "alive_meta_tag")
+  end
+
+  -- 3c. Peer table in tobefnz mutated by earlier finalizer during GCSswpallgc
+  do
+    local resurrected_b = nil
+    local B = setmetatable({ name = "B" }, { __gc = function(self) resurrected_b = self end })
+    local A = setmetatable({ peer = B }, { __gc = function(self)
+      self.peer.child = { "white_child_in_tobefnz" }
+    end })
+    local pad = {}
+    for i = 1, 2000 do pad[i] = { i } end
+    A, B = nil, nil
+    while not collectgarbage("step", 0) do end
+    while not collectgarbage("step", 0) do end
+    assert(resurrected_b and resurrected_b.child and resurrected_b.child[1] == "white_child_in_tobefnz")
+  end
+
+  -- 3d. Table in tobeswept assigned an already-old black weak metatable during GCSswpallgc
+  do
+    local old_weak_mt = { __mode = "v" }
+    collectgarbage("collect")
+    local val = { "collect_me" }
+    local o = { v = val }
+    local pad = {}
+    for i = 1, 2000 do pad[i] = { i } end
+    local assigned = false
+    setmetatable({}, { __gc = function()
+      assigned = true
+      setmetatable(o, old_weak_mt)
+    end })
+    while not assigned do collectgarbage("step", 0) end
+    while not collectgarbage("step", 0) do end
+    val = nil
+    while not collectgarbage("step", 0) do end
+    assert(o.v == nil)
+  end
+
+  -- 3e. Existing non-nil mt.__mode mutated in-place via luaV_fastset (TM_HASMODE)
+  do
+    local v_str = "v"
+    local mt = { __mode = false }
+    local val = { "collect_me_fastset" }
+    local o = setmetatable({ v = val }, mt)
+    collectgarbage("collect")
+    mt.__mode = v_str
+    val = nil
+    while not collectgarbage("step", 0) do end
+    assert(o.v == nil)
+  end
+
+  -- 3f. Finalization order when object in tobeswept is given __gc during GCSswpallgc after finobj/tobesweptfin
+  do
+    local order = {}
+    local A = setmetatable({ name = "A" }, { __gc = function() order[#order + 1] = "A" end })
+    local B = { name = "B" }
+    local pad = {}
+    for i = 1, 2000 do pad[i] = { i } end
+    local registered_b = false
+    setmetatable({}, { __gc = function()
+      registered_b = true
+      setmetatable(B, { __gc = function() order[#order + 1] = "B" end })
+    end })
+    while not registered_b do collectgarbage("step", 0) end
+    while not collectgarbage("step", 0) do end
+    A, B = nil, nil
+    collectgarbage("collect")
+    assert(order[1] == "B" and order[2] == "A")
+  end
+
+  resident = nil
+  collectgarbage("collect")
+  io.write("OK\n")
+end
+
 print("=== Running Randomized Cross-Generation GC Fuzz Suite ===")
 test_finalizer_order_across_generations()
 test_inbleach_cross_reference_mutations()
+test_gc_adversarial_edge_cases()
 
 local NUM_OPS = tonumber(os.getenv("FUZZ_OPS")) or 4000
 local seeds = { 101, 2026, 31415, 65537, 999983, 133742, 7777777, 42424242 }

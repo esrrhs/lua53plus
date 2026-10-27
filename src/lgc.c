@@ -169,11 +169,20 @@ static int iscleared (global_State *g, const TValue *o) {
 void luaC_barrier_ (lua_State *L, GCObject *o, GCObject *v) {
   global_State *g = G(L);
   lua_assert(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o));
-  if (keepinvariant(g))  /* must keep invariant? */
-    reallymarkobject(g, v);  /* restore invariant */
+  if (keepinvariant(g)) {  /* must keep invariant? */
+    if (o->tt == LUA_TPROTO && isold(o)) {
+      black2gray(o);
+      l_setbit(o->marked, TOUCHEDBIT);
+      *getgclist(o) = g->grayagain;
+      g->grayagain = o;
+    }
+    else
+      reallymarkobject(g, v);  /* restore invariant */
+  }
   else if (g->inbleach)  /* incrementally bleaching oldgen before restartcollection? */
     return;
-  else if (g->tobeswept == NULL && !isold(o) && !tofinalize(o)) {
+  else if (!isold(o) && (tofinalize(o) ? (g->tobesweptfin == NULL)
+                                       : (g->tobeswept == NULL))) {
     /* non-promoting sweep phase (e.g. fullgc or stopped manual sweep) */
     lua_assert(issweepphase(g));
     makewhite(g, o);  /* mark main obj. as white to avoid other barriers */
@@ -205,6 +214,12 @@ void luaC_barrierback_ (lua_State *L, Table *t) {
   lua_assert(isblack(t) && !isdead(g, t));
   if (g->inbleach)
     return;
+  if (!keepinvariant(g) && !isold(t) &&
+      (tofinalize(t) ? (g->tobesweptfin == NULL) : (g->tobeswept == NULL))) {
+    lua_assert(issweepphase(g));
+    makewhite(g, t);
+    return;
+  }
   black2gray(t);  /* make table gray (again) */
   l_setbit(t->marked, TOUCHEDBIT);
   linkgclist(t, g->grayagain);
@@ -224,7 +239,9 @@ void luaC_upvalbarrier_ (lua_State *L, UpVal *uv) {
   if (keepinvariant(g)) {
     markobject(g, o);
   }
-  else if (!g->inbleach && iswhite(o) && (g->oldgc != NULL || g->tobeswept != NULL)) {
+  else if (!g->inbleach && iswhite(o) &&
+           (g->oldgc != NULL || g->tobeswept != NULL ||
+            g->oldfinobj != NULL || g->tobesweptfin != NULL)) {
     if (g->nrembuf < GCREMBUF_MAX)
       g->rembuf[g->nrembuf++] = o;
     else
@@ -535,6 +552,8 @@ static void restartcollection (global_State *g) {
   g->oldweak = NULL;
   while (o != NULL) {
     GCObject *next = *getgclist(o);
+    if (g->oldcount > 0)
+      g->oldcount--;
     resetbits(o->marked, bitmask(OLDBIT) | bitmask(WEAKBIT) |
                          bitmask(TOUCHEDBIT) | bitmask(7));
     if (iswhite(o))
@@ -585,6 +604,10 @@ static void traverseweakvalue (global_State *g, Table *h) {
     linkgclist(h, g->grayagain);  /* must retraverse it in atomic phase */
   else if (hasclears)
     linkgclist(h, g->weak);  /* has to be cleared later */
+  else if (isold(h)) {
+    gray2black(h);
+    resetbits(h->marked, bitmask(WEAKBIT) | bitmask(7));
+  }
 }
 
 
@@ -633,6 +656,10 @@ static int traverseephemeron (global_State *g, Table *h) {
     linkgclist(h, g->ephemeron);  /* have to propagate again */
   else if (hasclears)  /* table has white keys? */
     linkgclist(h, g->allweak);  /* may have to clean white keys */
+  else if (isold(h)) {
+    gray2black(h);
+    resetbits(h->marked, bitmask(WEAKBIT) | bitmask(7));
+  }
   return marked;
 }
 
@@ -1220,19 +1247,30 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
       for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
       if (*p == o) {
         *p = o->next;
-        if (g->inbleach) {
+        if (g->oldcount > 0)
+          g->oldcount--;
+        if (keepinvariant(g)) {
+          resetbit(o->marked, OLDBIT);
+          l_setbit(o->marked, FINALIZEDBIT);
+          o->next = g->finobj;
+          g->finobj = o;
+          g->needmajor = 1;
+        }
+        else {
+          if (testbit(o->marked, TOUCHEDBIT)) {
+            GCObject **pg;
+            for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
+            if (*pg == o) *pg = *getgclist(o);
+          }
           o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                       bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
                       bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
-          if (g->finobj == NULL)
+          if (g->inbleach && g->finobj == NULL)
             g->fintail = &o->next;
           o->next = g->finobj;
           g->finobj = o;
-        }
-        else {
-          o->next = g->oldfinobj;
-          g->oldfinobj = o;
-          l_setbit(o->marked, FINALIZEDBIT);
+          if (!g->inbleach)
+            g->needmajor = 1;
         }
         return;
       }
@@ -1256,18 +1294,16 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
       for (p = &g->tobeswept; *p != o; p = &(*p)->next) { /* empty */ }
       *p = o->next;
       if (testbit(o->marked, TOUCHEDBIT)) {
-        o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(BLACKBIT) |
-                    bitmask(WEAKBIT) | bitmask(7))) |
-                    bitmask(FINALIZEDBIT) | bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
+        GCObject **pg;
+        for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
+        if (*pg == o) *pg = *getgclist(o);
       }
-      else {
-        o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(WEAKBIT) |
-                    bitmask(TOUCHEDBIT) | bitmask(7))) |
-                    bitmask(FINALIZEDBIT) | bitmask(BLACKBIT) | bitmask(OLDBIT));
-      }
-      o->next = g->oldfinobj;
-      g->oldfinobj = o;
-      g->oldcount++;
+      o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                  bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                  bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+      o->next = g->finobj;
+      g->finobj = o;
+      g->needmajor = 1;
     }
   }
 }
@@ -1317,8 +1353,15 @@ static void setpause (global_State *g) {
 */
 static void entersweep (lua_State *L) {
   global_State *g = G(L);
+  GCObject *o;
+  int white = luaC_white(g);
   g->gcstate = GCSswpallgc;
   lua_assert(g->sweepgc == NULL);
+  for (o = g->tobefnz; o != NULL; o = o->next) {
+    o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                bitmask(7))) | white);
+  }
   if (!g->infullgc && g->gcrunning) {
     g->tobeswept = g->allgc;
     g->allgc = NULL;
@@ -1405,11 +1448,11 @@ static l_mem atomic (lua_State *L) {
   {
     GCObject *w;
     for (w = g->weak; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+      if (isold(w)) { gray2black(w); resetbits(w->marked, bitmask(WEAKBIT) | bitmask(7)); }
     for (w = g->ephemeron; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+      if (isold(w)) { gray2black(w); resetbits(w->marked, bitmask(WEAKBIT) | bitmask(7)); }
     for (w = g->allweak; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); resetbit(w->marked, WEAKBIT); }
+      if (isold(w)) { gray2black(w); resetbits(w->marked, bitmask(WEAKBIT) | bitmask(7)); }
   }
   luaS_clearcache(g);
   g->currentwhite = cast_byte(otherwhite(g));  /* flip current white */
@@ -1502,7 +1545,7 @@ static lu_mem singlestep (lua_State *L) {
       return sweepstep(L, g, GCSswpend, NULL);
     }
     case GCSswpend: {  /* finish sweeps */
-      if (g->ismajor)
+      if (g->ismajor && !g->infullgc)
         g->lastmajcount = g->oldcount;
       g->infullgc = 0;
       makewhite(g, g->mainthread);  /* sweep main thread */
@@ -1559,6 +1602,9 @@ void luaC_cleartestgray (global_State *g) {
   GCObject *o;
   for (o = g->gray; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
   for (o = g->grayagain; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
+  for (o = g->weak; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
+  for (o = g->ephemeron; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
+  for (o = g->allweak; o != NULL; o = *getgclist(o)) resetbit(o->marked, 7);
 }
 #endif
 
@@ -1600,6 +1646,7 @@ void luaC_fullgc (lua_State *L, int isemergency) {
   lua_assert(g->gckind == KGC_NORMAL);
   if (isemergency) g->gckind = KGC_EMERGENCY;  /* set flag */
   if (keepinvariant(g)) {  /* black objects? */
+    mergeoldgen(g);
     g->infullgc = 1;
     entersweep(L); /* sweep everything to turn them back to white */
   }

@@ -24,7 +24,8 @@
 */
 #define wgkey(n)		(&(n)->i_key.nk)
 
-#define invalidateTMcache(t)	((t)->flags = 0)
+#define TM_HASMODE		(1u << 7)
+#define invalidateTMcache(t)	((t)->flags &= cast_byte(TM_HASMODE))
 
 
 /* true when 't' is using 'dummynode' as its hash part */
@@ -62,7 +63,7 @@ static l_inline const TValue *luaH_fastgetshortstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);
   for (;;) {
     const TValue *k = gkey(n);
-    if (l_likely(val_(k).gc == cast(GCObject *, key) && ttisshrstring(k)))
+    if (l_likely(ttisshrstring(k) && eqshrstr(tsvalue(k), key)))
       return gval(n);
     {
       int nx = gnext(n);

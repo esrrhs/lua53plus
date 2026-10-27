@@ -406,7 +406,7 @@ Table *luaH_new (lua_State *L) {
   GCObject *o = luaC_newobj(L, LUA_TTABLE, sizeof(Table));
   Table *t = gco2t(o);
   t->metatable = NULL;
-  t->flags = cast_byte(~0);
+  t->flags = cast_byte(~TM_HASMODE);
   t->array = NULL;
   t->sizearray = 0;
   setnodevector(L, t, 0);
@@ -502,8 +502,10 @@ TValue *luaH_newkey (lua_State *L, Table *t, const TValue *key) {
     }
   }
   setnodekey(L, &mp->i_key, key);
-  if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE])
+  if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE]) {
+    t->flags |= cast_byte(TM_HASMODE);
     G(L)->needmajor = 1;
+  }
   luaC_barrierback(L, t, key);
   lua_assert(ttisnil(gval(mp)));
   return gval(mp);
@@ -542,7 +544,7 @@ const TValue *luaH_getshortstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);
   const TValue *k = gkey(n);
   lua_assert(key->tt == LUA_TSHRSTR);
-  if (l_likely(val_(k).gc == obj2gco(key) && ttisshrstring(k)))
+  if (l_likely(ttisshrstring(k) && eqshrstr(tsvalue(k), key)))
     return gval(n);  /* hit at main position */
   {
     int nx = gnext(n);
@@ -551,7 +553,7 @@ const TValue *luaH_getshortstr (Table *t, TString *key) {
     do {  /* follow collision chain */
       n += nx;
       k = gkey(n);
-      if (val_(k).gc == obj2gco(key) && l_likely(ttisshrstring(k)))
+      if (ttisshrstring(k) && eqshrstr(tsvalue(k), key))
         return gval(n);  /* that's it */
       nx = gnext(n);
     } while (nx != 0);

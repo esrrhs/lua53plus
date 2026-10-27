@@ -860,7 +860,9 @@ LUA_API int lua_setmetatable (lua_State *L, int objindex) {
     case LUA_TTABLE: {
       hvalue(obj)->metatable = mt;
       if (mt) {
-        if (isold(gcvalue(obj)) && gfasttm(G(L), mt, TM_MODE) != NULL)
+        if ((isold(gcvalue(obj)) || G(L)->tobeswept != NULL ||
+             G(L)->tobesweptfin != NULL) &&
+            gfasttm(G(L), mt, TM_MODE) != NULL)
           G(L)->needmajor = 1;
         luaC_objbarrier(L, gcvalue(obj), mt);
         luaC_checkfinalizer(L, gcvalue(obj), mt);
