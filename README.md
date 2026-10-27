@@ -39,11 +39,11 @@ Imagine a game server or backend service:
 Now watch what standard Lua 5.3.4 does on **every single GC cycle**:
 
 1. **Mark Phase (`propagatemark`)**:
-   Starting from roots (`_G`, registry, stack), Lua traces every reachable object. Because the 1,000,000 config objects are reachable from `_G`, Lua must **walk through all 1,000,000 permanent objects** and repaint them ⚪White $\to$ 🔘Gray $\to$ ⚫Black!
+   Starting from roots (`_G`, registry, stack), Lua traces every reachable object. Because the 1,000,000 config objects are reachable from `_G`, Lua must **walk through all 1,000,000 permanent objects** and repaint them ⚪White → 🔘Gray → ⚫Black!
 2. **Sweep Phase (`sweeplist`)**:
    Once marking finishes, Lua must walk through the entire **1,001,000-node `allgc` linked list** from head to tail:
-   - For the **1,000 ⚪White temporary objects** $\to$ call `free()` (the only useful work!).
-   - For the **1,000,000 ⚫Black permanent objects** $\to$ **flip their color back from ⚫Black to ⚪White**, just so the next GC cycle can mark and sweep them all over again!
+   - For the **1,000 ⚪White temporary objects** → call `free()` (the only useful work!).
+   - For the **1,000,000 ⚫Black permanent objects** → **flip their color back from ⚫Black to ⚪White**, just so the next GC cycle can mark and sweep them all over again!
 
 > 💥 **The Bottleneck**: To reclaim just **1,000** temporary objects, standard Lua 5.3.4 repeatedly traverses **1,000,000** immortal objects twice per cycle (1M in `propagatemark` + 1M in `sweeplist`). In CPU profiles, `propagatemark` and `sweeplist` consume **30%+ of total CPU time** and cause multi-millisecond latency spikes!
 
@@ -71,13 +71,13 @@ Here is how it works in 3 simple steps:
 2. **Survivors during Sweep get promoted to the Old Room (`entersweep` + `sweeptobeswept`)**:
    When an incremental GC cycle enters the sweep phase, `lua53plus` detaches `allgc` into a temporary sweep list (`tobeswept`) and resets `allgc = NULL` for new allocations.
    As `sweeptobeswept` walks `tobeswept`:
-   - If an object is ⚪**White** (died young) $\to$ `freeobj()` frees it immediately.
-   - If an object is ⚫**Black** (survived the cycle) $\to$ **do NOT flip it back to White!** Instead, stamp it with **`BLACKBIT | OLDBIT`** and move it into **`g->oldgc` (the Old Room)**!
+   - If an object is ⚪**White** (died young) → `freeobj()` frees it immediately.
+   - If an object is ⚫**Black** (survived the cycle) → **do NOT flip it back to White!** Instead, stamp it with **`BLACKBIT | OLDBIT`** and move it into **`g->oldgc` (the Old Room)**!
 3. **Routine Minor GC cycles skip the Old Room completely (Zero Cost!)**:
    - **How `propagatemark` skips `oldgc`**:
      In Lua's marker, `markobject` only marks ⚪White objects (`if (iswhite(o))`). Because every object in `oldgc` is kept ⚫**Black** (`BLACKBIT | OLDBIT`), whenever the marker encounters a pointer to an old object, `iswhite(o)` is `false` — **it returns immediately without pushing the old object onto the gray list or scanning its children!**
    - **How `sweeptobeswept` skips `oldgc`**:
-     The sweeper only walks `tobeswept` (the ~1,000 young objects). **It never touches `g->oldgc` at all!** Sweep complexity drops from $O(\text{Total Heap})$ to $O(\text{Young Nursery})$.
+     The sweeper only walks `tobeswept` (the ~1,000 young objects). **It never touches `g->oldgc` at all!** Sweep complexity drops from `O(Total Heap)` to `O(Young Nursery)`.
 
 ---
 
@@ -154,7 +154,7 @@ Once oldgc is empty ──► Incremental Mark (GCSpropagate) ──► Incremen
 ```
 
 Every phase of a Major GC is sliced into tiny microsecond steps:
-1. **Incremental Bleaching (`bleachstep`)**: Each `singlestep` pops at most `GCSWEEPMAX` objects from the head of `g->oldgc` / `g->oldfinobj`, resets their mark bits to `luaC_white(g)`, and splices them onto `g->allgc` / `g->finobj` in $O(1)$ time with hardware prefetching (`l_prefetch`).
+1. **Incremental Bleaching (`bleachstep`)**: Each `singlestep` pops at most `GCSWEEPMAX` objects from the head of `g->oldgc` / `g->oldfinobj`, resets their mark bits to `luaC_white(g)`, and splices them onto `g->allgc` / `g->finobj` in `O(1)` time with hardware prefetching (`l_prefetch`).
 2. **Incremental Marking (`GCSpropagate`)**: Marks a few dozen objects per step.
 3. **Incremental Sweeping & Re-Promotion (`GCSswpallgc`)**: Sweeps `GCSWEEPMAX` objects per step—dead old objects are freed, and surviving old objects are promoted back into `g->oldgc` with `BLACKBIT | OLDBIT`.
 
@@ -167,7 +167,7 @@ Once GC overhead is eliminated, CPU profiling shows that the next largest hotspo
 1. **Header-Inlined Fast-Path (`luaH_fastgetshortstr`, `luaH_fastget`)**:
    Inlines short-string hash lookup and integer array-bounds checks directly into `lvm.c`, `lapi.c`, and `ltm.c`, eliminating cross-translation-unit call overhead in `luaV_execute`.
 2. **Pointer-First Interned Short-String Comparison**:
-   In Lua 5.3, all short strings ($\le 40$ bytes, `LUA_TSHRSTR`) are uniquely interned in the global string table—two equal short strings always have the exact same `TString*` pointer.
+   In Lua 5.3, all short strings (<= 40 bytes, `LUA_TSHRSTR`) are uniquely interned in the global string table—two equal short strings always have the exact same `TString*` pointer.
    Standard Lua checks the node's type tag `ttisshrstring(k)` first and compares the pointer second. `lua53plus` **compares the 64-bit pointer `val_(k).gc == obj2gco(key)` first** and verifies `ttisshrstring(k)` second, rejecting non-matching keys in a single register comparison with minimal branch mispredictions.
 3. **Cache-Line Buddy Probing (`getfreepos`)**:
    When a hash collision occurs in `luaH_newkey`, standard Lua scans backward from the end of the table (`lastfree`), scattering colliding nodes across distant memory addresses. `lua53plus` first probes buddy slots (`idx ^ 1`, `idx ^ 2`, `idx ^ 3`) within the same **64B / 128B CPU L1 cache line**, keeping collision chains cache-local.
