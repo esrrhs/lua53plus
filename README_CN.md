@@ -10,49 +10,188 @@
 
 ---
 
-## 为什么需要 `lua53plus`？
+## 零基础看懂 `lua53plus`：分代 GC 是怎么实现的？（给小白的图解指南）
 
-在标准 PUC-Lua 5.3.4 中，增量式标记-清除垃圾回收器（`lgc.c`）没有分代隔离机制（Lua 5.2 曾尝试的实验性分代 GC 在 Lua 5.3.0 中被移除）。当 Lua VM 持有较大的常驻内存堆（例如 50 MB ～ 500 MB 的配置与常驻对象）时，会出现显著的性能瓶颈：
-
-1. **`propagatemark` 与 `sweeplist` 占用 ~30% 以上的 CPU：**
-   每一次增量 GC 周期，无论实际只产生了几 MB 的请求临时垃圾，GC 都必须在标记阶段（`propagatemark` / `traversestrongtable`）和清除阶段（`sweeplist`）反复全量扫描 `allgc` 链表中数以百万计的常驻存活对象。
-2. **毫秒级 GC 停顿毛刺（Tail Latency Spikes）：**
-   在原子阶段（`atomic`）或调低 GC 触发阈值（如 `setpause <= 110`）以控制内存增长时，全堆扫描会导致严重的 CPU 缓存抖动（Cache Thrashing），引发数毫秒乃至数十毫秒的单步停顿。即便在 Lua 5.4 的分代 GC（`KGC_GEN`）中，一旦触发 Major GC（`fullgen`），也会退化为同步全量 Stop-The-World 扫描。
-3. **`luaH_getshortstr` 与 `luaH_get` 查找开销：**
-   标准 PUC-Lua 5.3.4 在每次虚拟机表访问（`OP_GETTABLE`、`OP_GETTABUP`、`OP_SELF`、`luaV_finishget`、`luaT_gettm`）时均需经由非内联的 `luaH_get` / `luaH_getstr` / `luaH_getshortstr` 函数调用，且先检查类型 tag 再比较指针，在高频短字符串字段访问下产生大量函数调用与分支预测开销。
-
-`lua53plus` 在**不引入任何外部依赖、完全不改变公开结构体布局、C ABI 及预编译字节码兼容性**的前提下，从 GC 架构与表查找热路径两方面彻底解决了上述瓶颈。
+如果你以前没读过 Lua 虚拟机源码，完全不用担心。下面我们用最通俗的“大白话 + 实例”带你一步步看懂：**为什么原生 Lua 5.3 内存一大就卡？`lua53plus` 又是怎么用几百行纯 C 代码把它彻底治好的？**
 
 ---
 
-## 核心优化详解
+### 第一步：原生 Lua 5.3.4 的 GC 是怎么干活的？为什么大内存下会卡？
 
-### 1. 老年代 GC 链表隔离（`oldgc`）、写屏障与全增量 Major GC（`src/lgc.c`, `src/lgc.h`, `src/lstate.h`）
-- **年轻代与老年代物理链表隔离（`allgc` vs. `oldgc`）：**
-  在增量 GC 进入清除阶段（`entersweep`）时，`lua53plus` 将当前 `allgc` 链表整体剥离至待清除链表 `tobeswept`（`finobj` 剥离至 `tobesweptfin`），并将 `allgc` 置空，使后续新分配的对象全部进入干净的年轻代链表。
-- **`sweeptobeswept` 自动晋升：**
-  在增量清除过程中，`tobeswept` 中不可达的年轻代临时对象被立即释放；存活下来的对象则自动晋升（Promote）至 `g->oldgc`（或 `g->oldfinobj`），并保持 `BLACKBIT | OLDBIT` 标记位。
-- **Minor GC 周期零开销跳过常驻对象：**
-  由于 `g->oldgc` 中的老年代常驻对象在 Minor GC 周期中始终保持黑色（`BLACKBIT | OLDBIT`）且不在 `g->allgc` 链表中：
-  - **标记阶段（`propagatemark`）** 遇到指向老年代对象的引用时因 `!iswhite(o)` 直接跳过，无需递归遍历老年代对象图；
-  - **清除阶段（`sweeptobeswept`）** 仅扫描年轻代 `tobeswept` 链表，完全不触碰 `g->oldgc`，将清除复杂度从 $O(\text{全堆对象数})$ 降至 $O(\text{年轻代对象数})$。
-- **精确写屏障（Write Barriers）与弱表/协程追踪：**
-  - 当老年代黑色对象被写入指向年轻代白色对象的引用时（`luaC_barrier_` / `luaC_barrierback_`），写屏障将老年代容器置为 `TOUCHEDBIT` 并挂入 `g->grayagain`（若在非标记阶段触发 userdata/upvalue 前向屏障，则记录在固定容量的记忆集缓冲区 `g->rembuf` 中）。
-  - 下一次 Minor GC 启动（`restartcollection`）时，直接从 `g->grayagain`、`g->oldweak`（存活协程与弱表）及 `g->rembuf` 初始化根灰色集合，仅重新扫描被修改过的老年代容器。
-- **100% 步进式全增量 Major GC（`startbleach` / `bleachstep`）：**
-  - 不同于 Lua 5.4 `KGC_GEN` 在 Major GC（`fullgen`）时同步一次性遍历全堆，`lua53plus` 的 Major GC 从准备阶段到标记、清除**全程 100% 增量步进执行**。
-  - 当老年代晋升对象数相比上次 Major GC 增长超过 50%（`oldcount > lastmajcount * 1.5`）或老年代表动态挂载 `__mode` 弱表元表需要触发 Major GC 时，`GCSpause` 进入增量漂白阶段（`g->inbleach = 1`）。
-  - 每次 `singlestep`（`bleachstep`）仅从 `g->oldgc` / `g->oldfinobj` 头部弹出最多 `GCSWEEPMAX` 个老年代对象，将其重置为当前白色（`luaC_white(g)`）并以 $O(1)$ 头插法移回 `g->allgc` / `g->finobj`（配合 `l_prefetch` 硬件预取），彻底消除了启动 Major GC 时遍历百万级老年代链表的同步毛刺，随后平滑进入增量标记（`GCSpropagate`）与增量清除阶段。
+#### 1. 先认识两个基本概念：一条大链表 `allgc` 与“三色标记法”
+在原生 Lua 5.3.4 里，你在 Lua 脚本里创建的**所有东西**（Table 表、函数、字符串、协程等），不管它是刚创建的还是已经活了十几个小时的，全都串在**同一条单向大链表**上，这条链表叫 **`allgc`**：
 
-### 2. 内联 `luaH_fastgetshortstr` 与缓存行友好的哈希冲突链（`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`）
-- **内联快速路径（`luaH_fastgetshortstr` / `luaH_fastgetstr` / `luaH_fastget`）：**
-  将短字符串哈希桶查找与整数数组下标边界检查内联至 `ltable.h`，直接在 `lvm.c`、`lapi.c` 和 `ltm.c` 的热路径中展开。
-- **优先比较短字符串唯一指针（Pointer-First Comparison）：**
-  利用 Lua 5.3 短字符串（`LUA_TSHRSTR`）全局唯一内联（Interned）的特性，优先执行 `val_(k).gc == obj2gco(key)` 64 位寄存器比较，再验证 `ttisshrstring(k)`，在单次比较中即可完成主桶命中判定或快速排除不匹配节点，显著降低分支预测失败率。
-- **同缓存行伙伴槽位探测（Cache-Line Buddy Probing）：**
-  在 `luaH_newkey` 处理哈希冲突寻找空闲节点（`getfreepos`）时，优先探测同一 64B/128B CPU 缓存行内的伙伴槽位（`idx ^ 1`、`idx ^ 2`、`idx ^ 3`），使冲突链尽可能落在同一 L1/L2 缓存行内。
-- **表扩容直接插入（`luaH_resize`）：**
-  在表扩容重哈希时，直接将旧节点写入新数组槽位或调用 `luaH_newkey`，省去原版通过 `luaH_set` 带来的冗余查找。
+```text
+原生 Lua 5.3.4 的内存世界（所有对象全挤在一条 allgc 链表里）：
+allgc ──► [临时表1] ──► [临时表2] ──► [配置表A] ──► [配置表B] ──► ... (后面还有 100 万个常驻对象)
+```
+
+为了找出哪些对象还在用、哪些已经是垃圾可以删掉，Lua 用的是经典的**三色标记-清扫法（Mark-and-Sweep）**。你可以把每个对象想象成身上挂着一块三种颜色之一的牌子：
+- ⚪ **白色（White）**：“还没检查过 / 疑似垃圾”。新创建的对象默认都是白色；如果一轮检查结束它还是白色，说明没人用它了，直接回收掉。
+- 🔘 **灰色（Gray）**：“我已经确认活着，但我的子对象（比如 Table 里的字段）还没检查完”。所有灰色对象会被临时串在一个待办列表（`gray` 链表）里排队等待检查。
+- ⚫ **黑色（Black）**：“我确认活着，而且我引用的所有子对象也都检查过了（安全通过）”。
+
+#### 2. 一个真实的线上灾难场景
+假设你写了一个游戏服或后台服务：
+- 启动时加载了 **100 万个配置项和常驻脚本对象**（大约占 **150 MB** 内存），它们在服务器运行期间**永远不会死**。
+- 服务器每秒收到大量请求，每次请求只创建 **1,000 个临时变量**，请求一结束这 1,000 个变量就变成了垃圾。
+
+现在，原生 Lua 5.3.4 开始做垃圾回收了。看看它每一轮 GC 要干什么蠢事：
+
+1. **标记阶段（`propagatemark`）**：
+   从全局变量 `_G` 和栈出发，顺藤摸瓜往下找。因为那 100 万个配置表全都挂在全局环境里，Lua 必须把这 **100 万个常驻对象从头到尾全部翻一遍**，把它们的牌子从 ⚪白 $\to$ 🔘灰 $\to$ ⚫黑！
+2. **清扫阶段（`sweeplist`）**：
+   标记完了，现在要把死掉的⚪白对象删掉。怎么找呢？Lua 必须顺着 `allgc` 那条 **100.1 万个节点的大链表，从头到尾再挨个走一遍**！
+   - 遇到那 **1,000 个⚪白临时对象** $\to$ 调用 `free()` 删掉（这是唯一有用的活）；
+   - 遇到那 **100 万个⚫黑常驻对象** $\to$ 把它们的牌子从⚫黑**重新翻回⚪白**，为了下一轮再重头检查一遍！
+
+> 💥 **痛点总结**：为了回收区区 **1,000 个**临时垃圾，原生 Lua 每一轮都要把 **100 万个**永远不会死的老对象“标记一遍 + 清扫刷白一遍”（一共遍历 200 万次）！CPU 火焰图里 `propagatemark` 和 `sweeplist` 两个函数直接吃掉 **30% 以上的 CPU**，而且经常引起几毫秒到几十毫秒的卡顿毛刺！
+
+---
+
+### 第二步：核心思路——把“常驻老员工”和“临时工”分两个房间管（`oldgc` 分代隔离）
+
+既然那 100 万个老对象根本不会死，为什么每轮都要查它们呢？
+`lua53plus` 的核心思想非常直观：**把链表一分为二，分设“年轻代房间（`allgc`）”和“老年代房间（`oldgc`）”！**
+
+```text
+==================== 原生 Lua 5.3.4（单链表混住） ====================
+allgc: [临时对象1] -> [临时对象2] -> [常驻对象1] -> [常驻对象2] -> ... -> [常驻对象100万]
+       (每轮 GC 都要把这 100.1 万个对象全部标记一遍 + 全部清扫一遍！)
+
+==================== lua53plus（年轻代与老年代物理隔离） ====================
+年轻代 (allgc):   [新临时对象1 (⚪白)] -> [新临时对象2 (⚪白)]   (只有 ~1,000 个，每轮只查这里！)
+老年代 (oldgc):   [常驻对象1 (⚫黑+OLD)] -> [常驻对象2 (⚫黑+OLD)] -> ... (100万个，永久挂黑牌免检！)
+```
+
+具体是怎么运转的？只有简单的三步：
+
+1. **新对象进年轻代（`allgc`）**：
+   刚创建的对象的牌子是⚪白色，全部挂在 `allgc` 链表上。
+2. **清扫时“活下来的晋升老年代”（`entersweep` + `sweeptobeswept`）**：
+   当一轮增量 GC 进入清扫阶段时，我们把当前的 `allgc` 链表摘下来交给清扫工（叫 `tobeswept`），同时把 `allgc` 清空用来接纳新对象。
+   清扫工在扫 `tobeswept` 时：
+   - 看到⚪**白色对象**（没活过这一轮的临时工）$\to$ 直接 `free` 释放内存！
+   - 看到⚫**黑色对象**（活过这一轮的幸存者）$\to$ **不把它翻回白色！** 而是直接给它盖上 **`BLACKBIT | OLDBIT`（黑色 + 老年代免检章）**，然后把它从年轻代摘下来，挂进 **`oldgc`（老年代链表）**！
+3. **下一轮日常 GC（Minor GC）直接双倍跳过！**
+   - **标记阶段（`propagatemark`）怎么跳过？**
+     Lua 的标记函数有一条铁律：**只处理⚪白色对象**（遇到⚫黑色说明已经检查过了，直接 return）。因为 `oldgc` 里的 100 万个老对象全都是⚫黑色，当标记扫描碰到老对象时，一看它是黑的，**立刻跳过，连它的子字段都不会去翻**！100 万个老对象实现了 **0 遍历**！
+   - **清扫阶段（`sweeptobeswept`）怎么跳过？**
+     清扫工只扫年轻代 `tobeswept` 里的那 1,000 个新对象，**根本不去碰 `oldgc` 链表**！100 万个老对象实现了 **0 清扫**！
+
+---
+
+### 第三步：最大的难点——如果“老对象”突然引用了“新对象”怎么办？（写屏障 Write Barrier）
+
+分两个房间管听起来很美，但有一个致命问题必须解决：
+
+> ❓ **思考题**：假设老年代房间里有一张常驻的表 `OldTable`（身上挂着⚫黑牌，每轮 GC 免检）。
+> 现在你的业务代码执行了一句：
+> ```lua
+> OldTable.player = { name = "新手玩家" }  -- 把一个刚创建的⚪白对象，塞进了⚫黑的老表里！
+> ```
+> 如果没有别的指向这个 `{ name = "新手玩家" }` 的变量，到了 GC 的时候，因为 `OldTable` 是免检的⚫黑对象，GC 根本不会去翻 `OldTable` 的内部字段！那 GC 就会误以为 `{ name = "新手玩家" }` 没人引用（还是⚪白色），把它当垃圾删掉，导致程序崩溃（悬垂指针）！
+
+怎么解决这个问题？答案就是 **写屏障（Write Barrier）——给老对象配一本“修改登记簿”**。
+
+在 Lua 虚拟机里，每当执行“往表里写字段”、“绑元表”、“改 Upvalue”时，都会经过一行极轻量的检查宏：
+**“是不是正在把一个⚪白色新对象，塞进一个⚫黑色对象里？”**
+
+如果是，就会触发写屏障。在 `lua53plus` 里，写屏障分三种情况精准处理：
+
+```text
+         [老年代对象 OldTable (⚫黑+OLD)]
+                       │
+      执行 OldTable.player = 新对象(⚪白)
+                       ▼
+           触发写屏障 luaC_barrierback_
+                       │
+      ┌────────────────┴────────────────┐
+      ▼                                 ▼
+1. 把 OldTable 涂成🔘灰色          2. 挂入 grayagain 登记簿链表
+   并打上 TOUCHEDBIT 标记             grayagain ──► [OldTable]
+```
+
+- **情况 A：修改了老 Table / 老闭包（后向屏障 `luaC_barrierback_` / `luaC_barrier_`）**
+  一旦你往 `OldTable` 里塞了新对象，`lua53plus` 立刻把 `OldTable` 的牌子从⚫黑改成🔘灰，贴上 **`TOUCHEDBIT`（被碰过）** 标签，并把它挂到一个专门的小登记簿链表 **`grayagain`** 上。
+  - 在本轮 GC 的最后一步（`atomic`）以及下一轮 Minor GC 开始时（`restartcollection`），GC **只需要翻开 `grayagain` 这本小登记簿**，把里面记着的这几个被改过的老 Table 重新扫描一遍，就能把它们肚子里装的⚪白新对象全部标活！
+  - **连续修改的聪明优化**：如果某个老 Table 正在被频繁塞入新数据，每次塞数据因为它已经是🔘灰色了，不会重复触发写屏障（零开销）；而且只要它身上贴着 `TOUCHEDBIT`，本轮清扫时它会保持🔘灰态留任一轮，直到下一轮没人再改它，才自动恢复⚫黑牌免检状态！
+- **情况 B：在非标记阶段修改了 Userdata 元表或闭合 Upvalue（前向记忆集 `rembuf`）**
+  像 Userdata 这类没有 `gclist` 链表指针的对象，或者在清扫/暂停阶段修改了闭合 Upvalue，写屏障会把被写入的新对象指针直接记入一个固定大小的轻量级数组 `g->rembuf[64]`，在下一轮 GC 开始时直接标活（如果极罕见地塞满了 64 个，则自动标记 `needmajor = 1` 在下一轮做一次全量检查）。
+- **情况 C：弱表（Weak Table）与协程栈（`oldweak` 专用链表）**
+  弱表（带有 `__mode = "k"` 或 `"v"` 的表）和存活的协程（`lua_State` 线程，其运行栈随时在变）不能简单挂黑牌免检。`lua53plus` 在晋升时不会把它们放进 `oldgc`，而是用一条专门的短链表 **`oldweak`** 把它们串起来。每轮 Minor GC 启动时，顺着 `oldweak` 精准扫描这几个协程和弱表即可，既保证语义 100% 精确，又完全不用扫描那 100 万个普通老对象。
+
+---
+
+### 第四步：如果老对象后来真的不用了，怎么回收？（全增量步进 Major GC vs Lua 5.4 的“一把梭”）
+
+> ❓ **第二个问题**：有些对象活过了一轮 GC 晋升到了老年代（比如一个在线玩家的数据表，活了 10 分钟），但 10 分钟后玩家下线了，这张老年代的表也变成了垃圾。如果老年代永远免检，这些死掉的老对象岂不是永远占着内存不放？
+
+没错！所以任何分代 GC 都需要定期做一次 **“全屋大扫除”（Major GC）**：把老年代里的对象也重新检查一遍，把已经死掉的老对象清理掉。
+
+#### 1. 什么时候触发大扫除（Major GC）？
+`lua53plus` 会在以下情况自动启动一次 Major GC：
+- 老年代对象总数比上一次大扫除后增长超过了 **50%**（`oldcount > lastmajcount * 1.5`）；
+- 用户显式调用了 `collectgarbage("collect")`；
+- 老年代对象在运行期动态绑定了包含 `__mode` 的弱表元表（`needmajor = 1`）。
+
+#### 2. 为什么 Lua 5.4 的分代 GC 在大扫除时还是会卡？
+很多人会问：Lua 5.4 不是也加了分代 GC（`KGC_GEN`）吗？
+如果你去翻 Lua 5.4 的 `lgc.c` 源码（`fullgen` 函数），你会发现一个惊人的事实：**Lua 5.4 的分代模式是非增量的！** 当 Lua 5.4 触发 Major GC 时，它会在**同一次 GC 调用里“一把梭”（Stop-The-World）**——一次性把几百万个老对象全部刷白、一次性全部标记、一次性全部清扫！在 170 MB 的堆上，这一把梭就会直接卡死主线程几十毫秒。
+
+#### 3. `lua53plus` 是怎么做到“连大扫除（Major GC）都完全不卡”的？（`startbleach` + `bleachstep`）
+在 `lua53plus` 中，**哪怕是全屋大扫除（Major GC），也是 100% 拆成微小的步进（Incremental Step-by-Step）完成的**！
+
+试想一下：如果要开始大扫除，首先得把 `oldgc` 房间里那 100 万个老对象身上的⚫黑牌洗掉（变回⚪白色），并把它们搬回 `allgc` 房间。如果在一个函数里写个 `for` 循环把 100 万个链表节点走一遍（哪怕只是改个颜色位），CPU 光遍历这 100 万个分散在内存各处的指针就要花好几毫秒！
+
+为了消灭这几毫秒的毛刺，`lua53plus` 设计了 **`startbleach` + `bleachstep` 增量漂白机制**：
+
+```text
+Major GC 启动时的增量漂白阶段（inbleach = 1）：
+每次 GC 小步进（singlestep）只从 oldgc 头部拿 GCSWEEPMAX（几十个）对象洗白并移回 allgc：
+
+Step 1:  oldgc ──► [老1]─►[老2]─►...─►[老100] ──► (剩余 999,900 个等后续步进慢慢搬)
+                    └─── 洗成⚪白，O(1) 头插搬回 allgc ───┘
+Step 2:  再搬 100 个...
+...
+全部搬完后 ──► 自动进入增量标记 (GCSpropagate) ──► 增量清扫 (GCSswpallgc) ──► 幸存者再次晋升回 oldgc！
+```
+
+整个 Major GC 就像“蚂蚁搬家”一样被均匀切碎到了数千次微小的业务步进中：
+1. **分批漂白（`bleachstep`）**：每次步进只从 `oldgc` / `oldfinobj` 头部弹出最多 `GCSWEEPMAX` 个对象，洗掉 `BLACKBIT | OLDBIT` 变成⚪白色，用 $O(1)$ 头插法挂回 `allgc` / `finobj`（同时用 `__builtin_prefetch` 预取下一个节点的 CPU 缓存行）。
+2. **分批标记（`GCSpropagate`）**：和普通增量标记一样，每次步进只标记几十个对象。
+3. **分批清扫与重晋升（`GCSswpallgc`）**：每次步进只清扫几十个对象——死掉的老对象在这一步被真正释放回收，而依然活着的老对象则再次被挂回 `oldgc` 贴上免检黑牌！
+
+> 🎯 **最终效果**：在 `lua53plus` 里，无论是平时的 Minor GC，还是定期的 Major GC，**没有任何一步会一次性遍历全堆链表**！在 171 MB 常驻大堆上，单步平均耗时仅 **2.6 ~ 5.2 微秒**，最大毛刺从原生 Lua 5.3.4 的 **28.73 毫秒** 降到了 **1.89 毫秒**（降低了 **15 倍以上**）。
+
+---
+
+### 第五步：顺手解决的第二大热点——短字符串查表 `luaH_getshortstr` 是怎么加速的？
+
+把 GC 优化完之后，性能分析（`perf`）显示虚拟机里剩下的头号热点变成了 **用字符串 key 查表**（例如访问 `player.hp`、`cfg["attack"]`、调用对象方法 `obj:step()`，底层全都在调 `luaH_get` $\to$ `luaH_getshortstr`）。
+
+原生 Lua 5.3.4 在这里有三个可以改进的地方，`lua53plus` 一并做了优化：
+
+1. **头文件内联消除函数调用（`luaH_fastgetshortstr`）**：
+   原生 Lua 5.3.4 每次执行字节码 `OP_GETTABLE` / `OP_GETTABUP` / `OP_SELF` 时，都要跨文件调用 `ltable.c` 里的 `luaH_get` 再调 `luaH_getshortstr`。`lua53plus` 在 `ltable.h` 中提供了 `static inline` 的 `luaH_fastgetshortstr` 和 `luaH_fastget`，让编译器直接把查表逻辑内联展开在虚拟机主循环 `luaV_execute` 内部。
+2. **指针优先比较（Pointer-First Comparison）**：
+   在 Lua 5.3 中，所有长度 $\le 40$ 字节的短字符串（`LUA_TSHRSTR`）在全局字符串表里都是**唯一驻留（Interned）**的——也就是说，两个相同的短字符串，它们的内存地址指针必然完全相等。
+   - **原生 Lua 5.3.4** 在哈希桶里找 key 时，先判断 `ttisshrstring(k)`（节点的类型是不是短字符串），再比较指针 `eqshrstr(tsvalue(k), key)`。如果一张表里全是短字符串 key，第一个分支永远为真，但第二次才比指针。
+   - **`lua53plus`** 反过来：**先直接比 64 位指针 `val_(k).gc == obj2gco(key)`**，相等时再验证 `ttisshrstring(k)`！因为不匹配的 key 在第一次指针比较时就 100% 被排除了，CPU 只需要一次寄存器比较就能决定是不是命中，大幅降低了分支预测失败率。
+3. **同缓存行伙伴槽位探测（Cache-Line Buddy Probing）**：
+   当两个不同的 key 算出了同一个哈希桶位置（发生哈希冲突）时，原生 Lua 会从表尾指针 `lastfree` 倒着随便找一个空位塞进去，导致冲突链上的两个节点在内存里相隔十万八千里，查表时引发多次 CPU 缓存未命中（Cache Miss）。
+   `lua53plus` 在 `getfreepos` 分配冲突节点时，**优先检查当前哈希桶旁边异或距离为 `idx ^ 1`、`idx ^ 2`、`idx ^ 3` 的“邻居槽位”**。因为一个 `Node` 是 32 字节，相邻的 2~4 个节点正好落在同一个 **64B / 128B CPU L1 缓存行（Cache Line）** 里！这样顺着冲突链查找时，数据已经在 L1 缓存里了，几乎零内存延迟。
+
+---
+
+## 核心改动文件一览
+
+| 源码文件 | 核心改动说明 |
+| :--- | :--- |
+| `src/lgc.c`, `src/lgc.h` | 实现 `oldgc` / `oldfinobj` / `oldweak` 老年代隔离、`sweeptobeswept` 晋升、写屏障（`TOUCHEDBIT` + `grayagain` + `rembuf`）以及 `startbleach` / `bleachstep` 全增量 Major GC |
+| `src/lstate.h`, `src/lstate.c` | 在 `global_State` 内部末尾扩展老年代链表与增量漂白状态字段（完全不影响外部 C API / ABI） |
+| `src/ltable.h`, `src/ltable.c` | 实现内联 `luaH_fastgetshortstr` / `luaH_fastget`、指针优先比较、`getfreepos` 缓存行伙伴探测与 `luaH_resize` 直接插入 |
+| `src/lvm.c`, `src/lvm.h`, `src/ltm.c`, `src/lapi.c`, `src/lundump.c` | 虚拟机查表热路径切换至内联快速入口；补齐动态设置弱表 `__mode`、老 `Proto->cache` 闭包复用及字节码反序列化时的写屏障 |
 
 ---
 
@@ -134,4 +273,4 @@ make clean
 
 ## 开源协议
 
-与 PUC-Lua 5.3.4 相同 —— [MIT License](http://www.lua.org/license.html).
+与 PUC-Lua 5.3.4 相同 —— [MIT License](http://www.lua.org/license.html)。

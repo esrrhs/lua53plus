@@ -10,49 +10,167 @@ It is engineered for long-running C/C++ services and game/application servers th
 
 ---
 
-## Why `lua53plus`?
+## How `lua53plus` Works: A Beginner-Friendly Visual Guide to Generational GC
 
-In standard PUC-Lua 5.3.4, the incremental mark-and-sweep garbage collector (`lgc.c`) is non-generational (the nursery generational collector introduced experimentally in Lua 5.2 was removed in Lua 5.3.0). When a Lua VM holds a large resident heap (e.g., 50 MB – 500 MB of long-lived objects):
-
-1. **`propagatemark` & `sweeplist` Dominate CPU (~30%+ CPU Overhead):**
-   Every single incremental GC cycle must re-traverse (`propagatemark` / `traversestrongtable`) and re-sweep (`sweeplist`) the entire `allgc` list of millions of long-lived objects just to reclaim a few megabytes of newly allocated request temporaries.
-2. **Multi-Millisecond GC Latency Spikes:**
-   Transitioning through atomic/sweep phases or running aggressive low-pause GC steps (`setpause <= 110`) causes severe cache thrashing across the resident heap and multi-millisecond frame stalls (up to 10–30 ms). Even in Lua 5.4's generational mode (`KGC_GEN`), falling back to a Major GC (`fullgen`) executes a synchronous stop-the-world full collection.
-3. **`luaH_getshortstr` & `luaH_get` Call/Branch Overhead:**
-   In standard PUC-Lua 5.3.4, every VM table lookup (`OP_GETTABLE`, `OP_GETTABUP`, `OP_SELF`, `luaV_finishget`, `luaT_gettm`) dispatches through out-of-line `luaH_get` / `luaH_getstr` / `luaH_getshortstr` functions, checking the type tag before the interned pointer and incurring call overhead on every primary-bucket hit.
-
-`lua53plus` eliminates these bottlenecks directly inside the standard Lua 5.3.4 codebase **without external dependencies, without breaking C ABI, `lua_State` / `TValue` / `Table` struct layouts, or precompiled bytecode compatibility**.
+Even if you have never read Lua's C source code before, this section walks you through **why standard Lua 5.3 slows down on large heaps, and how `lua53plus` fixes it step by step.**
 
 ---
 
-## Key Optimizations
+### Step 1: How Standard Lua 5.3.4 GC Works (And Why It Stalls on Large Heaps)
 
-### 1. Old-Generation GC Isolation (`oldgc`), Write Barriers & 100% Incremental Major GC (`src/lgc.c`, `src/lgc.h`, `src/lstate.h`)
-- **Two-Generation List Partitioning (`allgc` vs. `oldgc`):**
-  When entering the sweep phase (`entersweep`) of an incremental GC cycle, `lua53plus` detaches the current young list (`allgc` -> `tobeswept`, `finobj` -> `tobesweptfin`) and resets `allgc = NULL` so newly allocated objects go cleanly into the young generation.
-- **`sweeptobeswept` Promotion:**
-  During incremental sweep, dead young objects in `tobeswept` are freed immediately, while surviving objects are promoted into `g->oldgc` (or `g->oldfinobj`) with `BLACKBIT | OLDBIT` set.
-- **Zero-Cost Old-Gen Skipping in Minor Cycles:**
-  Because promoted objects in `g->oldgc` remain marked `BLACKBIT | OLDBIT` across minor cycles and are isolated from `g->allgc`:
-  - `propagatemark` automatically skips them (`iswhite(o)` is false).
-  - `sweeptobeswept` never scans `g->oldgc` at all, reducing sweep complexity from $O(\text{Total Heap})$ to $O(\text{Young Nursery})$.
-- **Write-Barrier & Weak/Thread Tracking:**
-  - When a black old object is mutated to reference a white young object (`luaC_barrier_` / `luaC_barrierback_`), the barrier marks the container with `TOUCHEDBIT` and links it onto `g->grayagain` (or records the target in bounded remembered-set buffer `g->rembuf` for userdata/upvalue barriers outside the mark phase).
-  - At the start of the next minor cycle (`restartcollection`), `g->gray` is seeded directly from `g->grayagain`, `g->oldweak` (surviving threads and weak tables), and `g->rembuf`, re-traversing only mutated old containers and roots.
-- **100% Incremental Step-by-Step Major GC (`startbleach` / `bleachstep`):**
-  - Unlike Lua 5.4's generational collector where a Major GC (`fullgen`) performs a synchronous stop-the-world pass, `lua53plus` executes Major GC **100% incrementally from start to finish**.
-  - When an incremental cycle triggers a Major GC (e.g., when `oldcount > lastmajcount * 1.5` or weak-mode metatables are dynamically attached to old tables), `GCSpause` enters an incremental bleaching phase (`g->inbleach = 1`).
-  - Each `singlestep` (`bleachstep`) bleaches at most `GCSWEEPMAX` objects from the head of `g->oldgc` / `g->oldfinobj` back to `luaC_white(g)` and splices them onto `g->allgc` / `g->finobj` in $O(1)$ time with software prefetching (`l_prefetch`), avoiding any synchronous full-list walk before transitioning into `restartcollection` $\to$ `GCSpropagate` $\to$ `GCSatomic` $\to$ `entersweep`.
+#### 1. The Single Linked List (`allgc`) and Three-Color Marking
+In standard PUC-Lua 5.3.4, **every single collectable object** you create in Lua (tables, functions, strings, coroutines), whether it was created 1 microsecond ago or 10 hours ago, is linked into **one giant singly-linked list** called **`allgc`**:
 
-### 2. Inlined `luaH_fastgetshortstr` & Cache-Local Collision Chains (`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`)
-- **Header-Inlined Fast-Path (`luaH_fastgetshortstr`, `luaH_fastgetstr`, `luaH_fastget`):**
-  Inlines the short-string hash lookup and integer array-bounds check directly into `lvm.c`, `lapi.c`, and `ltm.c`.
-- **Pointer-First Interned Short-String Comparison:**
-  Since short strings (`LUA_TSHRSTR`) are uniquely interned in Lua 5.3, comparing `val_(k).gc == obj2gco(key)` first (before checking `ttisshrstring(k)`) rejects non-matching keys in a single 64-bit register comparison and eliminates branch mispredictions on string-keyed tables.
-- **Cache-Line Buddy Probing (`getfreepos`):**
-  When inserting colliding keys in `luaH_newkey`, `getfreepos` first probes buddy slots (`idx ^ 1`, `idx ^ 2`, `idx ^ 3`) within the same 64B/128B CPU cache line before falling back to the reverse `lastfree` scan, keeping collision chains within L1/L2 cache lines.
-- **Direct Rehash Insertion (`luaH_resize`):**
-  During table growth/rehash, existing non-nil entries are inserted directly via array slot or `luaH_newkey` without redundant `luaH_get` searches.
+```text
+Standard Lua 5.3.4 Heap (all objects mixed in a single 'allgc' list):
+allgc ──► [TempTable1] ──► [TempTable2] ──► [ConfigA] ──► [ConfigB] ──► ... (1,000,000 resident objects)
+```
+
+To figure out which objects are still in use and which ones are garbage, Lua uses **Three-Color Incremental Mark-and-Sweep**. Imagine every object wears a tag with one of three colors:
+- ⚪ **White**: *"Unvisited / candidate for deletion"*. Every newly created object starts out White. If an object is still White at the end of the marking phase, nobody can reach it anymore, so it gets freed during the sweep phase.
+- 🔘 **Gray**: *"I am alive, but the objects I point to (e.g., fields inside this table) haven't been checked yet"*. Gray objects are linked into a to-do queue (`gray` list).
+- ⚫ **Black**: *"I am alive, and all objects I directly point to have been checked"*.
+
+#### 2. A Concrete Production Scenario
+Imagine a game server or backend service:
+- At startup, it loads **1,000,000 configuration entries and script functions** (~**150 MB** of memory) that stay alive forever.
+- Every incoming request creates **1,000 temporary tables** that become garbage as soon as the request finishes.
+
+Now watch what standard Lua 5.3.4 does on **every single GC cycle**:
+
+1. **Mark Phase (`propagatemark`)**:
+   Starting from roots (`_G`, registry, stack), Lua traces every reachable object. Because the 1,000,000 config objects are reachable from `_G`, Lua must **walk through all 1,000,000 permanent objects** and repaint them ⚪White $\to$ 🔘Gray $\to$ ⚫Black!
+2. **Sweep Phase (`sweeplist`)**:
+   Once marking finishes, Lua must walk through the entire **1,001,000-node `allgc` linked list** from head to tail:
+   - For the **1,000 ⚪White temporary objects** $\to$ call `free()` (the only useful work!).
+   - For the **1,000,000 ⚫Black permanent objects** $\to$ **flip their color back from ⚫Black to ⚪White**, just so the next GC cycle can mark and sweep them all over again!
+
+> 💥 **The Bottleneck**: To reclaim just **1,000** temporary objects, standard Lua 5.3.4 repeatedly traverses **1,000,000** immortal objects twice per cycle (1M in `propagatemark` + 1M in `sweeplist`). In CPU profiles, `propagatemark` and `sweeplist` consume **30%+ of total CPU time** and cause multi-millisecond latency spikes!
+
+---
+
+### Step 2: The Core Idea — Separate "Permanent Residents" from "Temporary Visitors" (`oldgc` Isolation)
+
+If those 1,000,000 resident objects stay alive across cycles, why check them every round?
+`lua53plus` splits the heap into **two physical rooms (linked lists)**: a **Young Room (`allgc`)** and an **Old Room (`oldgc`)**:
+
+```text
+==================== Standard Lua 5.3.4 (One Mixed List) ====================
+allgc: [Temp1] -> [Temp2] -> [Resident1] -> [Resident2] -> ... -> [Resident 1,000,000]
+       (Every GC cycle marks all 1,001,000 objects AND sweeps all 1,001,000 objects!)
+
+==================== lua53plus (Young vs. Old Physical Isolation) ====================
+Young Gen (allgc): [NewTemp1 (⚪White)] -> [NewTemp2 (⚪White)]          (~1,000 objects: scanned!)
+Old Gen (oldgc):   [Resident1 (⚫Black+OLD)] -> [Resident2 (⚫Black+OLD)] (1,000,000 objects: skipped!)
+```
+
+Here is how it works in 3 simple steps:
+
+1. **New objects always enter the Young Room (`allgc`)**:
+   Every newly allocated object starts out ⚪White at the head of `allgc`.
+2. **Survivors during Sweep get promoted to the Old Room (`entersweep` + `sweeptobeswept`)**:
+   When an incremental GC cycle enters the sweep phase, `lua53plus` detaches `allgc` into a temporary sweep list (`tobeswept`) and resets `allgc = NULL` for new allocations.
+   As `sweeptobeswept` walks `tobeswept`:
+   - If an object is ⚪**White** (died young) $\to$ `freeobj()` frees it immediately.
+   - If an object is ⚫**Black** (survived the cycle) $\to$ **do NOT flip it back to White!** Instead, stamp it with **`BLACKBIT | OLDBIT`** and move it into **`g->oldgc` (the Old Room)**!
+3. **Routine Minor GC cycles skip the Old Room completely (Zero Cost!)**:
+   - **How `propagatemark` skips `oldgc`**:
+     In Lua's marker, `markobject` only marks ⚪White objects (`if (iswhite(o))`). Because every object in `oldgc` is kept ⚫**Black** (`BLACKBIT | OLDBIT`), whenever the marker encounters a pointer to an old object, `iswhite(o)` is `false` — **it returns immediately without pushing the old object onto the gray list or scanning its children!**
+   - **How `sweeptobeswept` skips `oldgc`**:
+     The sweeper only walks `tobeswept` (the ~1,000 young objects). **It never touches `g->oldgc` at all!** Sweep complexity drops from $O(\text{Total Heap})$ to $O(\text{Young Nursery})$.
+
+---
+
+### Step 3: The Hard Part — What If an "Old Object" Points to a "New Object"? (Write Barriers)
+
+Splitting into two rooms sounds simple, but there is one classic trap we must solve:
+
+> ❓ **The Trap**: Suppose `OldTable` lives in `oldgc` (wearing a ⚫Black badge, so GC skips it).
+> Now your Lua script runs:
+> ```lua
+> OldTable.player = { name = "Newbie" }  -- Stores a brand-new ⚪White table inside a ⚫Black old table!
+> ```
+> If no other variable points to `{ name = "Newbie" }`, what happens during the next Minor GC? Because `OldTable` is ⚫Black, the marker skips `OldTable` and never looks inside its fields! As a result, `{ name = "Newbie" }` remains ⚪White and gets mistakenly freed by the sweeper while `OldTable.player` still points to it!
+
+How does `lua53plus` prevent this? With **Write Barriers — a "Modified Old Objects Logbook"**:
+
+```text
+         [Old Object: OldTable (⚫Black+OLD)]
+                       │
+      Executes: OldTable.player = NewObj(⚪White)
+                       ▼
+         Triggers Write Barrier (luaC_barrierback_)
+                       │
+      ┌────────────────┴────────────────┐
+      ▼                                 ▼
+1. Turn OldTable 🔘Gray            2. Link onto 'grayagain' logbook
+   and set TOUCHEDBIT                 grayagain ──► [OldTable]
+```
+
+Whenever Lua mutates a ⚫Black object to reference a ⚪White object, a lightweight write barrier fires:
+
+- **Case A: Mutating a container like a Table or Closure (`luaC_barrierback_` / `luaC_barrier_`)**:
+  `lua53plus` turns `OldTable` from ⚫Black back to 🔘Gray, sets **`TOUCHEDBIT`** on it, and links it onto **`g->grayagain`** (our "Modified Logbook").
+  - Before the cycle finishes (`atomic`) and at the start of the next Minor GC (`restartcollection`), GC simply opens the `grayagain` logbook and scans **only the few old tables that were actually modified**, marking their new ⚪White children alive—without scanning the other 999,990 untouched old tables!
+  - Furthermore, while `OldTable` is 🔘Gray, repeated writes to `OldTable` don't even trigger the barrier again (zero overhead). Only when `OldTable` goes a full cycle without being touched does it return to ⚫Black.
+- **Case B: Forward barriers outside the mark phase (Userdata metatable / Closed Upvalue `rembuf`)**:
+  For objects without a `gclist` pointer (such as `userdata`) or closed upvalue writes outside the mark phase, the barrier records the target object in a small fixed-size remembered buffer `g->rembuf[64]`, which `restartcollection` marks at the start of the next cycle.
+- **Case C: Weak Tables and Coroutines (`oldweak` list)**:
+  Weak tables (`__mode = "k"` / `"v"`) and live coroutines (`lua_State` threads whose stacks change without write barriers) cannot be left ⚫Black. When they survive a cycle, `sweeptobeswept` links them onto a dedicated short list **`g->oldweak`** so `restartcollection` re-traverses them on every Minor GC.
+
+---
+
+### Step 4: How Do Dead Old Objects Get Reclaimed? (100% Incremental Major GC vs. Lua 5.4's Stop-The-World `fullgen`)
+
+> ❓ **Second Question**: What if an object survives one cycle, gets promoted to `oldgc` (e.g., a player session that lasted 10 minutes), and *then* disconnects and dies? If `oldgc` is skipped forever, wouldn't dead old objects leak memory?
+
+Yes! That is why every generational collector periodically runs a **Major GC (Full-Heap Cleaning)** to reclaim old objects that have died.
+
+#### 1. When does `lua53plus` trigger a Major GC?
+- When the number of promoted old objects grows by more than **50%** since the last Major GC (`oldcount > lastmajcount * 1.5`);
+- When the user explicitly calls `collectgarbage("collect")`;
+- When a weak-mode metatable (`__mode`) is dynamically attached to an old table (`needmajor = 1`).
+
+#### 2. Why Lua 5.4's Generational GC (`KGC_GEN`) Still Spikes on Large Heaps
+In Lua 5.4's generational mode (`lgc.c`: `fullgen`), when the collector decides to run a Major GC, it executes a **synchronous, non-incremental stop-the-world pass**—bleaching, marking, and sweeping the entire multi-hundred-megabyte heap in a single step, causing tens of milliseconds of pause latency!
+
+#### 3. How `lua53plus` Makes Even Major GC 100% Incremental (`startbleach` + `bleachstep`)
+In `lua53plus`, **even Major GC is 100% incremental step-by-step from start to finish!**
+
+To start a Major GC, all 1,000,000 ⚫Black old objects in `oldgc` must first be "bleached" back to ⚪White and moved back into `allgc`. Even a simple `for` loop that walks 1,000,000 linked-list pointers in one shot to flip their color bits would cause a multi-millisecond CPU cache-miss spike!
+
+Instead, `lua53plus` uses **`startbleach` + `bleachstep` incremental bleaching**:
+
+```text
+Incremental Bleaching Phase at the Start of Major GC (inbleach = 1):
+Each GC singlestep pops at most GCSWEEPMAX (~a few dozen) objects from 'oldgc',
+bleaches them to ⚪White, and prepends them to 'allgc' in O(1):
+
+Step 1:  oldgc ──► [Old1]─►[Old2]─►...─►[Old100] ──► (999,900 remaining for subsequent steps)
+                    └─── Bleached to ⚪White & O(1) prepended to allgc ───┘
+Step 2:  Bleach next 100 objects...
+...
+Once oldgc is empty ──► Incremental Mark (GCSpropagate) ──► Incremental Sweep (GCSswpallgc)
+```
+
+Every phase of a Major GC is sliced into tiny microsecond steps:
+1. **Incremental Bleaching (`bleachstep`)**: Each `singlestep` pops at most `GCSWEEPMAX` objects from the head of `g->oldgc` / `g->oldfinobj`, resets their mark bits to `luaC_white(g)`, and splices them onto `g->allgc` / `g->finobj` in $O(1)$ time with hardware prefetching (`l_prefetch`).
+2. **Incremental Marking (`GCSpropagate`)**: Marks a few dozen objects per step.
+3. **Incremental Sweeping & Re-Promotion (`GCSswpallgc`)**: Sweeps `GCSWEEPMAX` objects per step—dead old objects are freed, and surviving old objects are promoted back into `g->oldgc` with `BLACKBIT | OLDBIT`.
+
+---
+
+### Step 5: Accelerating the #2 CPU Hotspot — Short-String Table Lookups (`luaH_fastgetshortstr`)
+
+Once GC overhead is eliminated, CPU profiling shows that the next largest hotspot in Lua is **string-keyed table lookups** (`t.field`, `t["key"]`, `obj:method()`). `lua53plus` speeds this up in three ways:
+
+1. **Header-Inlined Fast-Path (`luaH_fastgetshortstr`, `luaH_fastget`)**:
+   Inlines short-string hash lookup and integer array-bounds checks directly into `lvm.c`, `lapi.c`, and `ltm.c`, eliminating cross-translation-unit call overhead in `luaV_execute`.
+2. **Pointer-First Interned Short-String Comparison**:
+   In Lua 5.3, all short strings ($\le 40$ bytes, `LUA_TSHRSTR`) are uniquely interned in the global string table—two equal short strings always have the exact same `TString*` pointer.
+   Standard Lua checks the node's type tag `ttisshrstring(k)` first and compares the pointer second. `lua53plus` **compares the 64-bit pointer `val_(k).gc == obj2gco(key)` first** and verifies `ttisshrstring(k)` second, rejecting non-matching keys in a single register comparison with minimal branch mispredictions.
+3. **Cache-Line Buddy Probing (`getfreepos`)**:
+   When a hash collision occurs in `luaH_newkey`, standard Lua scans backward from the end of the table (`lastfree`), scattering colliding nodes across distant memory addresses. `lua53plus` first probes buddy slots (`idx ^ 1`, `idx ^ 2`, `idx ^ 3`) within the same **64B / 128B CPU L1 cache line**, keeping collision chains cache-local.
 
 ---
 
