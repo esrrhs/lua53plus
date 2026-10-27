@@ -171,6 +171,8 @@ void luaC_barrier_ (lua_State *L, GCObject *o, GCObject *v) {
   lua_assert(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o));
   if (keepinvariant(g))  /* must keep invariant? */
     reallymarkobject(g, v);  /* restore invariant */
+  else if (g->inbleach)  /* incrementally bleaching oldgen before restartcollection? */
+    return;
   else if (g->tobeswept == NULL && !isold(o) && !tofinalize(o)) {
     /* non-promoting sweep phase (e.g. fullgc or stopped manual sweep) */
     lua_assert(issweepphase(g));
@@ -201,6 +203,8 @@ void luaC_barrier_ (lua_State *L, GCObject *o, GCObject *v) {
 void luaC_barrierback_ (lua_State *L, Table *t) {
   global_State *g = G(L);
   lua_assert(isblack(t) && !isdead(g, t));
+  if (g->inbleach)
+    return;
   black2gray(t);  /* make table gray (again) */
   l_setbit(t->marked, TOUCHEDBIT);
   linkgclist(t, g->grayagain);
@@ -220,7 +224,7 @@ void luaC_upvalbarrier_ (lua_State *L, UpVal *uv) {
   if (keepinvariant(g)) {
     markobject(g, o);
   }
-  else if (iswhite(o) && (g->oldgc != NULL || g->tobeswept != NULL)) {
+  else if (!g->inbleach && iswhite(o) && (g->oldgc != NULL || g->tobeswept != NULL)) {
     if (g->nrembuf < GCREMBUF_MAX)
       g->rembuf[g->nrembuf++] = o;
     else
@@ -383,9 +387,83 @@ static GCObject **findlast (GCObject **p) {
 ** Merge all promoted old-generation objects back into 'allgc' and 'finobj'
 ** as white objects before starting a major (full) collection.
 */
+/*
+** Start incremental bleaching of promoted old-generation lists ('oldgc' and
+** 'oldfinobj') during GCSpause before a major collection. Each singlestep
+** bleaches at most GCSWEEPMAX objects and moves them into 'allgc'/'finobj'
+** in O(1) without any synchronous full-heap list walk.
+*/
+static void restartcollection (global_State *g);
+
+static void startbleach (global_State *g) {
+  int white = luaC_white(g);
+  GCObject *curr;
+  g->gray = NULL;
+  g->grayagain = NULL;
+  g->oldweak = NULL;
+  g->nrembuf = 0;
+  for (curr = g->allgc; curr != NULL; curr = curr->next) {
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  for (curr = g->finobj; curr != NULL; curr = curr->next) {
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+  }
+  makewhite(g, g->mainthread);
+  resetbits(g->mainthread->marked, bitmask(OLDBIT) | bitmask(WEAKBIT) |
+                                   bitmask(TOUCHEDBIT) | bitmask(7));
+  g->oldcount = 0;
+  g->needmajor = 0;
+  g->ismajor = 1;
+  g->minorcycles = 0;
+  g->inbleach = 1;
+}
+
+
+static lu_mem bleachstep (global_State *g) {
+  int white = luaC_white(g);
+  lu_mem count = GCSWEEPMAX;
+  while (g->oldgc != NULL && count > 0) {
+    GCObject *curr = g->oldgc;
+    g->oldgc = curr->next;
+    if (g->oldgc != NULL)
+      l_prefetch(g->oldgc);
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+    curr->next = g->allgc;
+    g->allgc = curr;
+    count--;
+  }
+  while (g->oldfinobj != NULL && count > 0) {
+    GCObject *curr = g->oldfinobj;
+    g->oldfinobj = curr->next;
+    if (g->oldfinobj != NULL)
+      l_prefetch(g->oldfinobj);
+    curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                   bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                   bitmask(7))) | white);
+    curr->next = g->finobj;
+    g->finobj = curr;
+    count--;
+  }
+  if (g->oldgc != NULL || g->oldfinobj != NULL)
+    return (GCSWEEPMAX * GCSWEEPCOST);
+  g->inbleach = 0;
+  g->GCmemtrav = g->strt.size * sizeof(GCObject*);
+  restartcollection(g);
+  g->gcstate = GCSpropagate;
+  return g->GCmemtrav;
+}
+
+
 static void mergeoldgen (global_State *g) {
   int white = luaC_white(g);
   GCObject **p;
+  g->inbleach = 0;
   g->gray = NULL;
   g->grayagain = NULL;
   g->oldweak = NULL;
@@ -1136,9 +1214,18 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
       for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
       if (*p == o) {
         *p = o->next;
-        o->next = g->oldfinobj;
-        g->oldfinobj = o;
-        l_setbit(o->marked, FINALIZEDBIT);
+        if (g->inbleach) {
+          o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                      bitmask(OLDBIT) | bitmask(WEAKBIT) | bitmask(TOUCHEDBIT) |
+                      bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+          o->next = g->finobj;
+          g->finobj = o;
+        }
+        else {
+          o->next = g->oldfinobj;
+          g->oldfinobj = o;
+          l_setbit(o->marked, FINALIZEDBIT);
+        }
         return;
       }
     }
@@ -1351,11 +1438,17 @@ static lu_mem singlestep (lua_State *L) {
   global_State *g = G(L);
   switch (g->gcstate) {
     case GCSpause: {
-      g->GCmemtrav = g->strt.size * sizeof(GCObject*);
+      if (g->inbleach)
+        return bleachstep(g);
       if (g->needmajor || g->infullgc || !g->gcrunning ||
           (gettotalbytes(g) < 512 * 1024 && g->minorcycles >= 1) ||
           (gettotalbytes(g) < 4 * 1024 * 1024 && g->minorcycles >= 16) ||
           (g->lastmajcount > 0 && g->oldcount > g->lastmajcount + (g->lastmajcount >> 1))) {
+        if (!g->infullgc && g->gcrunning &&
+            (g->oldgc != NULL || g->oldfinobj != NULL)) {
+          startbleach(g);
+          return bleachstep(g);
+        }
         mergeoldgen(g);
         g->ismajor = 1;
         g->minorcycles = 0;
@@ -1366,6 +1459,7 @@ static lu_mem singlestep (lua_State *L) {
         if (!g->ismajor)
           g->minorcycles++;
       }
+      g->GCmemtrav = g->strt.size * sizeof(GCObject*);
       restartcollection(g);
       g->gcstate = GCSpropagate;
       return g->GCmemtrav;
@@ -1471,8 +1565,8 @@ void luaC_step (lua_State *L) {
   do {  /* repeat until pause or enough "credit" (negative debt) */
     lu_mem work = singlestep(L);  /* perform one single step */
     debt -= work;
-  } while (debt > -GCSTEPSIZE && g->gcstate != GCSpause);
-  if (g->gcstate == GCSpause)
+  } while (debt > -GCSTEPSIZE && (g->gcstate != GCSpause || g->inbleach));
+  if (g->gcstate == GCSpause && !g->inbleach)
     setpause(g);  /* pause until next cycle */
   else {
     debt = (debt / g->gcstepmul) * STEPMULADJ;  /* convert 'work units' to Kb */

@@ -1085,7 +1085,7 @@ LUA_API int lua_gc (lua_State *L, int what, int data) {
         luaC_checkGC(L);
       }
       g->gcrunning = oldrunning;  /* restore previous state */
-      if (debt > 0 && g->gcstate == GCSpause)  /* end of cycle? */
+      if (debt > 0 && g->gcstate == GCSpause && !g->inbleach)  /* end of cycle? */
         res = 1;  /* signal it */
       break;
     }

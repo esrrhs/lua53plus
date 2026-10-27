@@ -164,6 +164,7 @@ typedef struct global_State {
   lu_byte ismajor;  /* true if current cycle is a major GC */
   lu_byte needmajor;  /* true if next cycle must be a major GC */
   lu_byte infullgc;  /* true if inside luaC_fullgc */
+  lu_byte inbleach;  /* true if incrementally bleaching oldgen in GCSpause */
 } global_State;
 
 

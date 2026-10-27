@@ -17,7 +17,7 @@
 1. **`propagatemark` 与 `sweeplist` 占用 ~30% 以上的 CPU：**
    每一次增量 GC 周期，无论实际只产生了几 MB 的请求临时垃圾，GC 都必须在标记阶段（`propagatemark` / `traversestrongtable`）和清除阶段（`sweeplist`）反复全量扫描 `allgc` 链表中数以百万计的常驻存活对象。
 2. **毫秒级 GC 停顿毛刺（Tail Latency Spikes）：**
-   在原子阶段（`atomic`）或调低 GC 触发阈值（如 `setpause <= 110`）以控制内存增长时，全堆扫描会导致严重的 CPU 缓存抖动（Cache Thrashing），引发数毫秒乃至数十毫秒的单步停顿。
+   在原子阶段（`atomic`）或调低 GC 触发阈值（如 `setpause <= 110`）以控制内存增长时，全堆扫描会导致严重的 CPU 缓存抖动（Cache Thrashing），引发数毫秒乃至数十毫秒的单步停顿。即便在 Lua 5.4 的分代 GC（`KGC_GEN`）中，一旦触发 Major GC（`fullgen`），也会退化为同步全量 Stop-The-World 扫描。
 3. **`luaH_getshortstr` 与 `luaH_get` 查找开销：**
    标准 PUC-Lua 5.3.4 在每次虚拟机表访问（`OP_GETTABLE`、`OP_GETTABUP`、`OP_SELF`、`luaV_finishget`、`luaT_gettm`）时均需经由非内联的 `luaH_get` / `luaH_getstr` / `luaH_getshortstr` 函数调用，且先检查类型 tag 再比较指针，在高频短字符串字段访问下产生大量函数调用与分支预测开销。
 
@@ -27,7 +27,7 @@
 
 ## 核心优化详解
 
-### 1. 老年代 GC 链表隔离（`oldgc`）与写屏障机制（`src/lgc.c`, `src/lgc.h`, `src/lstate.h`）
+### 1. 老年代 GC 链表隔离（`oldgc`）、写屏障与全增量 Major GC（`src/lgc.c`, `src/lgc.h`, `src/lstate.h`）
 - **年轻代与老年代物理链表隔离（`allgc` vs. `oldgc`）：**
   在增量 GC 进入清除阶段（`entersweep`）时，`lua53plus` 将当前 `allgc` 链表整体剥离至待清除链表 `tobeswept`（`finobj` 剥离至 `tobesweptfin`），并将 `allgc` 置空，使后续新分配的对象全部进入干净的年轻代链表。
 - **`sweeptobeswept` 自动晋升：**
@@ -39,7 +39,10 @@
 - **精确写屏障（Write Barriers）与弱表/协程追踪：**
   - 当老年代黑色对象被写入指向年轻代白色对象的引用时（`luaC_barrier_` / `luaC_barrierback_`），写屏障将老年代容器置为 `TOUCHEDBIT` 并挂入 `g->grayagain`（若在非标记阶段触发 userdata/upvalue 前向屏障，则记录在固定容量的记忆集缓冲区 `g->rembuf` 中）。
   - 下一次 Minor GC 启动（`restartcollection`）时，直接从 `g->grayagain`、`g->oldweak`（存活协程与弱表）及 `g->rembuf` 初始化根灰色集合，仅重新扫描被修改过的老年代容器。
-  - 当老年代晋升对象数量相比上次 Major GC 增长超过 50%（`oldcount > lastmajcount * 1.5`）、显式调用 `collectgarbage("collect")` 或老年代对象动态设置 `__mode` 弱表元表时，自动执行 `mergeoldgen` 触发全量 Major GC，确保长周期下无内存泄漏。
+- **100% 步进式全增量 Major GC（`startbleach` / `bleachstep`）：**
+  - 不同于 Lua 5.4 `KGC_GEN` 在 Major GC（`fullgen`）时同步一次性遍历全堆，`lua53plus` 的 Major GC 从准备阶段到标记、清除**全程 100% 增量步进执行**。
+  - 当老年代晋升对象数相比上次 Major GC 增长超过 50%（`oldcount > lastmajcount * 1.5`）或老年代表动态挂载 `__mode` 弱表元表需要触发 Major GC 时，`GCSpause` 进入增量漂白阶段（`g->inbleach = 1`）。
+  - 每次 `singlestep`（`bleachstep`）仅从 `g->oldgc` / `g->oldfinobj` 头部弹出最多 `GCSWEEPMAX` 个老年代对象，将其重置为当前白色（`luaC_white(g)`）并以 $O(1)$ 头插法移回 `g->allgc` / `g->finobj`（配合 `l_prefetch` 硬件预取），彻底消除了启动 Major GC 时遍历百万级老年代链表的同步毛刺，随后平滑进入增量标记（`GCSpropagate`）与增量清除阶段。
 
 ### 2. 内联 `luaH_fastgetshortstr` 与缓存行友好的哈希冲突链（`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`）
 - **内联快速路径（`luaH_fastgetshortstr` / `luaH_fastgetstr` / `luaH_fastget`）：**
@@ -63,12 +66,12 @@
 
 | 测试指标 | PUC-Lua 5.3.4 | `lua53plus` | 提升幅度 |
 | :--- | :---: | :---: | :---: |
-| **45 MB 常驻堆 — 标准参数 (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3182 s (1,571K req/s)** | **吞吐量提升 +39.3%** |
+| **45 MB 常驻堆 — 标准参数 (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3144 s (1,590K req/s)** | **吞吐量提升 +41.0%** |
 | **45 MB 常驻堆 — 低延迟参数 (`pause=110`)** | 0.4260 s (1,174K req/s) | **0.3109 s (1,608K req/s)** | **吞吐量提升 +37.0%** |
 | **171 MB 常驻堆 — 低延迟参数 (`pause=110`, 200万请求)** | 3.6575 s (547K req/s) | **1.5203 s (1,316K req/s)** | **吞吐量 2.41 倍（耗时降低 58.4%）** |
 | **GC 单步停顿延迟 — 平均值 (`collectgarbage("step", 64)`)** | 19.7 µs | **2.6 µs** | **平均停顿降低 7.6 倍** |
 | **GC 单步停顿延迟 — P99** | 150.0 µs | **65.0 µs** | **P99 停顿降低 2.3 倍** |
-| **GC 单步停顿延迟 — 最大毛刺 (45 MB / 171 MB 堆)** | 3.85 ms / 28.73 ms | **0.54 ms / 2.14 ms** | **最大毛刺降低 7.1 ～ 13.4 倍** |
+| **GC 单步停顿延迟 — 最大毛刺 (45 MB / 171 MB 堆)** | 3.85 ms / 28.73 ms | **0.53 ms / 1.89 ms** | **最大毛刺降低 7.3 ～ 15.2 倍** |
 
 ### 2. CPU 热点占比剖析（130 MB 常驻堆下的 `perf record` 采样）
 
@@ -80,15 +83,15 @@
 | `luaV_execute`（有效字节码执行） | 5.59% | **38.44%** | CPU 算力从 GC 空转与查找开销回到业务字节码执行 |
 | **200 万次请求总耗时与峰值内存** | **3.005 s（峰值 151.5 MB）** | **2.087 s（峰值 132.2 MB）** | **提速 1.44 倍，且峰值内存降低 19.3 MB** |
 
-### 3. 短字符串表查找与综合业务负载（`bench/bench_table_lookup.lua`, `bench/bench_mixed_workload.lua`)
+### 3. 短字符串表查找与综合业务负载（`bench/bench_table_lookup.lua`, `bench/bench_mixed_workload.lua`）
 
 | 基准测试项 | PUC-Lua 5.3.4 | `lua53plus` | 性能提升 |
 | :--- | :---: | :---: | :---: |
-| **短字符串字段直接访问（8000 万次查找）** | 0.5728 s | **0.5051 s** | **+13.4%** |
+| **短字符串字段直接访问（8000 万次查找）** | 0.5728 s | **0.4669 s** | **+22.7%** |
 | **大表短字符串冲突链查找（2048 键）** | 2.0797 s | **1.8050 s** | **+15.2%** |
 | **OOP 方法调用与二级 `__index` 元表查找** | 0.3244 s | **0.2730 s** | **+18.8%** |
 | **动态短字符串表构建与扩容（`luaH_resize`）** | 0.0189 s | **0.0175 s** | **+8.0%** |
-| **综合端到端业务负载（`bench_mixed_workload.lua`）** | 0.0696 s | **0.0532 s** | **+30.8%** |
+| **综合端到端业务负载（`bench_mixed_workload.lua`）** | 0.0696 s | **0.0498 s** | **+39.8%** |
 
 ---
 
@@ -131,4 +134,4 @@ make clean
 
 ## 开源协议
 
-与 PUC-Lua 5.3.4 相同 —— [MIT License](http://www.lua.org/license.html)。
+与 PUC-Lua 5.3.4 相同 —— [MIT License](http://www.lua.org/license.html).
