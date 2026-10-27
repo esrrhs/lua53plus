@@ -4,7 +4,7 @@
 
 [中文文档 (README_CN.md)](./README_CN.md)
 
-**`lua53plus`** is a high-performance, 100% C API / ABI drop-in compatible enhancement of **PUC-Lua 5.3.4**.
+**`lua53plus`** is a high-performance, 100% C API / ABI drop-in compatible enhancement of **PUC-Lua 5.3.4** written in pure single-threaded C.
 
 It is engineered for long-running C/C++ services and game/application servers that embed Lua 5.3 with a **large resident heap** (hundreds of megabytes of long-lived configuration tables, function prototypes, closures, and persistent state) while continuously processing high-frequency requests that allocate short-lived objects and perform intensive string-keyed table lookups.
 
@@ -21,7 +21,7 @@ In standard PUC-Lua 5.3.4, the incremental mark-and-sweep garbage collector (`lg
 3. **`luaH_getshortstr` & `luaH_get` Call/Branch Overhead:**
    In standard PUC-Lua 5.3.4, every VM table lookup (`OP_GETTABLE`, `OP_GETTABUP`, `OP_SELF`, `luaV_finishget`, `luaT_gettm`) dispatches through out-of-line `luaH_get` / `luaH_getstr` / `luaH_getshortstr` functions, checking the type tag before the interned pointer and incurring call overhead on every primary-bucket hit.
 
-`lua53plus` eliminates these bottlenecks directly inside the standard Lua 5.3.4 codebase **without breaking C ABI, `lua_State` / `TValue` / `Table` struct layouts, or precompiled bytecode compatibility**.
+`lua53plus` eliminates these bottlenecks directly inside the standard Lua 5.3.4 codebase **without external dependencies, without breaking C ABI, `lua_State` / `TValue` / `Table` struct layouts, or precompiled bytecode compatibility**.
 
 ---
 
@@ -41,15 +41,9 @@ In standard PUC-Lua 5.3.4, the incremental mark-and-sweep garbage collector (`lg
   - At the start of the next minor cycle (`restartcollection`), `g->gray` is seeded directly from `g->grayagain`, `g->oldweak` (surviving threads and weak tables), and `g->rembuf`, re-traversing only mutated old containers and roots.
   - Periodic major collections (`mergeoldgen`) merge `g->oldgc` back into `g->allgc` when old-generation object count grows by 50% (`oldcount > lastmajcount * 1.5`), when `collectgarbage("collect")` is invoked, or when weak-mode metatables are dynamically attached to old tables.
 
-### 2. Optional Concurrent Background Sweep Worker (`LUA_ASYNC_SWEEP=1`)
-- On POSIX platforms (`Linux` / `macOS`), `lua53plus` includes an optional background pthread deallocation worker in `src/lgc.c` (enabled via `LUA_ASYNC_SWEEP=1`).
-- During `freeobj`, memory blocks of dead tables (`array` and `node` vectors), closures, prototypes, userdata, and strings are staged into a lock-amortized 256-entry batch buffer and pushed to a 4096-slot ring buffer drained asynchronously by a background worker thread calling `frealloc(ud, ptr, osize, 0)`.
-- Short-string hash table unlinking (`luaS_remove`) and `GCdebt` accounting remain strictly synchronous on the main VM thread, preserving 100% thread safety without locking normal VM execution.
-- `luaC_fullgc` and `lua_close` (`luaC_freeallobjects`) automatically flush and synchronize the worker queue.
-
-### 3. Inlined `luaH_fastgetshortstr` & Cache-Local Collision Chains (`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`)
+### 2. Inlined `luaH_fastgetshortstr` & Cache-Local Collision Chains (`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`)
 - **Header-Inlined Fast-Path (`luaH_fastgetshortstr`, `luaH_fastgetstr`, `luaH_fastget`):**
-  Inlines the primary hash bucket lookup and integer array-bounds check directly into `lvm.c`, `lapi.c`, and `ltm.c`.
+  Inlines the short-string hash lookup and integer array-bounds check directly into `lvm.c`, `lapi.c`, and `ltm.c`.
 - **Pointer-First Interned Short-String Comparison:**
   Since short strings (`LUA_TSHRSTR`) are uniquely interned in Lua 5.3, comparing `val_(k).gc == obj2gco(key)` first (before checking `ttisshrstring(k)`) rejects non-matching keys in a single 64-bit register comparison and eliminates branch mispredictions on string-keyed tables.
 - **Cache-Line Buddy Probing (`getfreepos`):**
@@ -67,14 +61,14 @@ All benchmarks are located in [`bench/`](./bench/) and compare clean **PUC-Lua 5
 
 Simulates a server VM holding a large resident object graph (long-lived tables, strings, and closures) while continuously allocating short-lived per-request tables (`req`, `payload`, `meta`) and looking up resident config entries:
 
-| Metric | PUC-Lua 5.3.4 | `lua53plus` | `lua53plus` (`LUA_ASYNC_SWEEP=1`) | Improvement |
-| :--- | :---: | :---: | :---: | :---: |
-| **45 MB Resident Heap — Standard Pause (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3182 s (1,571K req/s)** | **0.3085 s (1,621K req/s)** | **+39% – +44% throughput** |
-| **45 MB Resident Heap — Low Pause (`pause=110`)** | 0.4260 s (1,174K req/s) | **0.3109 s (1,608K req/s)** | **0.3210 s (1,558K req/s)** | **+37% throughput** |
-| **171 MB Resident Heap — Low Pause (`pause=110`, 2M reqs)** | 3.6575 s (547K req/s) | **1.5203 s (1,316K req/s)** | **1.5086 s (1,326K req/s)** | **2.42x throughput (-58.7% time)** |
-| **GC Step Pause Latency — Average (`collectgarbage("step", 64)`)** | 19.7 µs | **2.6 µs** | **2.6 µs** | **7.6x lower avg pause** |
-| **GC Step Pause Latency — P99** | 150.0 µs | **65.0 µs** | **66.0 µs** | **2.3x lower P99 pause** |
-| **GC Step Pause Latency — Max Spike (45 MB / 171 MB heap)** | 3.85 ms / 28.73 ms | **0.54 ms / 2.14 ms** | **0.51 ms / 2.10 ms** | **7.1x – 13.4x lower max pause** |
+| Metric | PUC-Lua 5.3.4 | `lua53plus` | Improvement |
+| :--- | :---: | :---: | :---: |
+| **45 MB Resident Heap — Standard Pause (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3182 s (1,571K req/s)** | **+39.3% throughput** |
+| **45 MB Resident Heap — Low Pause (`pause=110`)** | 0.4260 s (1,174K req/s) | **0.3109 s (1,608K req/s)** | **+37.0% throughput** |
+| **171 MB Resident Heap — Low Pause (`pause=110`, 2M reqs)** | 3.6575 s (547K req/s) | **1.5203 s (1,316K req/s)** | **2.41x throughput (-58.4% time)** |
+| **GC Step Pause Latency — Average (`collectgarbage("step", 64)`)** | 19.7 µs | **2.6 µs** | **7.6x lower avg pause** |
+| **GC Step Pause Latency — P99** | 150.0 µs | **65.0 µs** | **2.3x lower P99 pause** |
+| **GC Step Pause Latency — Max Spike (45 MB / 171 MB heap)** | 3.85 ms / 28.73 ms | **0.54 ms / 2.14 ms** | **7.1x – 13.4x lower max pause** |
 
 ### 2. CPU Hotspot Breakdown (`perf record` on 130 MB Resident Heap Workload)
 
@@ -120,11 +114,10 @@ This produces:
 
 ### Drop-In Replacement in C/C++ Projects
 
-`lua53plus` preserves 100% of the public headers (`lua.h`, `lauxlib.h`, `lualib.h`, `luaconf.h`), C ABI, and precompiled bytecode format of PUC-Lua 5.3.4:
+`lua53plus` preserves 100% of the public headers (`lua.h`, `lauxlib.h`, `lualib.h`, `luaconf.h`), C ABI, build flags, and precompiled bytecode format of PUC-Lua 5.3.4:
 
 1. Replace your project's `lua-5.3.4/src` directory (or `liblua.a`) with `lua53plus/src`.
-2. Ensure `-lpthread` is present in your linker flags on Linux/macOS (automatically included by `make linux`).
-3. *(Optional)* Set environment variable `LUA_ASYNC_SWEEP=1` at runtime to offload GC object deallocation (`free`) to a background worker thread.
+2. Recompile — no changes to your C/C++ host code, linker flags, or Lua scripts are required.
 
 ### Running Benchmarks
 
@@ -132,9 +125,6 @@ This produces:
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua
-
-# With concurrent background sweep enabled:
-LUA_ASYNC_SWEEP=1 ./src/lua bench/bench_gc_largeheap.lua
 ```
 
 ---

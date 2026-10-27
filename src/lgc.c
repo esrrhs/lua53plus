@@ -10,13 +10,7 @@
 #include "lprefix.h"
 
 
-#include <stdlib.h>
 #include <string.h>
-
-#if defined(LUA_USE_POSIX) && !defined(LUA_USE_C89)
-#include <pthread.h>
-#define LUA_HAS_ASYNCSWEEP	1
-#endif
 
 #include "lua.h"
 
@@ -100,187 +94,6 @@
 #define GCREMBUF_MAX	(sizeof(((global_State *)0)->rembuf) / sizeof(GCObject *))
 
 static void reallymarkobject (global_State *g, GCObject *o);
-
-
-/*
-** {======================================================
-** Optional Concurrent Background Sweep Worker (POSIX)
-** =======================================================
-*/
-
-#if defined(LUA_HAS_ASYNCSWEEP)
-
-#define ASYNC_BATCH_CAP	4096
-
-typedef struct AsyncFreeItem {
-  void *ptr;
-  size_t osize;
-} AsyncFreeItem;
-
-typedef struct AsyncSweepCtx {
-  pthread_t thread;
-  pthread_mutex_t mtx;
-  pthread_cond_t cv_work;
-  pthread_cond_t cv_done;
-  lua_Alloc frealloc;
-  void *ud;
-  AsyncFreeItem *queue;
-  size_t head;
-  size_t tail;
-  size_t count;
-  size_t cap;
-  size_t nstaging;
-  int busy;
-  int stop;
-  AsyncFreeItem staging[256];
-} AsyncSweepCtx;
-
-static void *asyncsweep_worker (void *arg) {
-  AsyncSweepCtx *ctx = cast(AsyncSweepCtx *, arg);
-  AsyncFreeItem local[256];
-  pthread_mutex_lock(&ctx->mtx);
-  for (;;) {
-    while (ctx->count == 0 && !ctx->stop)
-      pthread_cond_wait(&ctx->cv_work, &ctx->mtx);
-    if (ctx->count == 0 && ctx->stop)
-      break;
-    while (ctx->count > 0) {
-      size_t n = 0;
-      while (ctx->count > 0 && n < 256) {
-        local[n++] = ctx->queue[ctx->head];
-        ctx->head = (ctx->head + 1) & (ctx->cap - 1);
-        ctx->count--;
-      }
-      ctx->busy = 1;
-      pthread_mutex_unlock(&ctx->mtx);
-      {
-        size_t i;
-        for (i = 0; i < n; i++)
-          (*ctx->frealloc)(ctx->ud, local[i].ptr, local[i].osize, 0);
-      }
-      pthread_mutex_lock(&ctx->mtx);
-      ctx->busy = 0;
-    }
-    pthread_cond_broadcast(&ctx->cv_done);
-  }
-  pthread_mutex_unlock(&ctx->mtx);
-  return NULL;
-}
-
-static AsyncSweepCtx *asyncsweep_get (global_State *g) {
-  if (g->asyncsweep == NULL) {
-    const char *env = getenv("LUA_ASYNC_SWEEP");
-    if (env != NULL && env[0] == '1') {
-      AsyncSweepCtx *ctx = cast(AsyncSweepCtx *, malloc(sizeof(AsyncSweepCtx)));
-      if (ctx != NULL) {
-        ctx->cap = ASYNC_BATCH_CAP;
-        ctx->queue = cast(AsyncFreeItem *, malloc(sizeof(AsyncFreeItem) * ctx->cap));
-        if (ctx->queue == NULL) {
-          free(ctx);
-          g->asyncsweep = cast(void *, ~(size_t)0);
-          return NULL;
-        }
-        ctx->head = ctx->tail = ctx->count = ctx->nstaging = 0;
-        ctx->busy = ctx->stop = 0;
-        ctx->frealloc = g->frealloc;
-        ctx->ud = g->ud;
-        pthread_mutex_init(&ctx->mtx, NULL);
-        pthread_cond_init(&ctx->cv_work, NULL);
-        pthread_cond_init(&ctx->cv_done, NULL);
-        if (pthread_create(&ctx->thread, NULL, asyncsweep_worker, ctx) != 0) {
-          pthread_mutex_destroy(&ctx->mtx);
-          pthread_cond_destroy(&ctx->cv_work);
-          pthread_cond_destroy(&ctx->cv_done);
-          free(ctx->queue);
-          free(ctx);
-          g->asyncsweep = cast(void *, ~(size_t)0);
-          return NULL;
-        }
-        g->asyncsweep = ctx;
-        return ctx;
-      }
-    }
-    g->asyncsweep = cast(void *, ~(size_t)0);
-    return NULL;
-  }
-  else if (g->asyncsweep == cast(void *, ~(size_t)0))
-    return NULL;
-  else
-    return cast(AsyncSweepCtx *, g->asyncsweep);
-}
-
-static void asyncsweep_flush_staging (global_State *g, AsyncSweepCtx *ctx) {
-  size_t n = ctx->nstaging;
-  size_t i = 0;
-  if (n == 0) return;
-  ctx->nstaging = 0;
-  pthread_mutex_lock(&ctx->mtx);
-  while (i < n && ctx->count < ctx->cap) {
-    ctx->queue[ctx->tail] = ctx->staging[i++];
-    ctx->tail = (ctx->tail + 1) & (ctx->cap - 1);
-    ctx->count++;
-  }
-  if (ctx->count > 0)
-    pthread_cond_signal(&ctx->cv_work);
-  pthread_mutex_unlock(&ctx->mtx);
-  while (i < n) {
-    (*g->frealloc)(g->ud, ctx->staging[i].ptr, ctx->staging[i].osize, 0);
-    i++;
-  }
-}
-
-static void asyncsweep_push (global_State *g, AsyncSweepCtx *ctx,
-                             void *ptr, size_t osize) {
-  if (ptr == NULL) return;
-  g->GCdebt -= cast(l_mem, osize);
-  ctx->staging[ctx->nstaging].ptr = ptr;
-  ctx->staging[ctx->nstaging].osize = osize;
-  if (++ctx->nstaging == 256)
-    asyncsweep_flush_staging(g, ctx);
-}
-
-static void asyncsweep_flush (global_State *g) {
-  AsyncSweepCtx *ctx;
-  if (g->asyncsweep == NULL || g->asyncsweep == cast(void *, ~(size_t)0))
-    return;
-  ctx = cast(AsyncSweepCtx *, g->asyncsweep);
-  asyncsweep_flush_staging(g, ctx);
-  pthread_mutex_lock(&ctx->mtx);
-  if (ctx->count > 0)
-    pthread_cond_signal(&ctx->cv_work);
-  while (ctx->count > 0 || ctx->busy)
-    pthread_cond_wait(&ctx->cv_done, &ctx->mtx);
-  pthread_mutex_unlock(&ctx->mtx);
-}
-
-static void asyncsweep_shutdown (global_State *g) {
-  AsyncSweepCtx *ctx;
-  if (g->asyncsweep == NULL || g->asyncsweep == cast(void *, ~(size_t)0)) {
-    g->asyncsweep = NULL;
-    return;
-  }
-  ctx = cast(AsyncSweepCtx *, g->asyncsweep);
-  pthread_mutex_lock(&ctx->mtx);
-  ctx->stop = 1;
-  pthread_cond_signal(&ctx->cv_work);
-  pthread_mutex_unlock(&ctx->mtx);
-  pthread_join(ctx->thread, NULL);
-  pthread_mutex_destroy(&ctx->mtx);
-  pthread_cond_destroy(&ctx->cv_work);
-  pthread_cond_destroy(&ctx->cv_done);
-  free(ctx->queue);
-  free(ctx);
-  g->asyncsweep = NULL;
-}
-
-#else
-
-#define asyncsweep_flush(g)	((void)0)
-#define asyncsweep_shutdown(g)	((void)0)
-
-#endif
-
-/* }====================================================== */
 
 
 /*
@@ -1011,67 +824,6 @@ static void freeLclosure (lua_State *L, LClosure *cl) {
 
 
 static void freeobj (lua_State *L, GCObject *o) {
-#if defined(LUA_HAS_ASYNCSWEEP)
-  global_State *g = G(L);
-  AsyncSweepCtx *ctx = asyncsweep_get(g);
-  if (ctx != NULL) {
-    switch (o->tt) {
-      case LUA_TPROTO: {
-        Proto *f = gco2p(o);
-        asyncsweep_push(g, ctx, f->code, sizeof(Instruction) * f->sizecode);
-        asyncsweep_push(g, ctx, f->p, sizeof(Proto *) * f->sizep);
-        asyncsweep_push(g, ctx, f->k, sizeof(TValue) * f->sizek);
-        asyncsweep_push(g, ctx, f->lineinfo, sizeof(int) * f->sizelineinfo);
-        asyncsweep_push(g, ctx, f->locvars, sizeof(LocVar) * f->sizelocvars);
-        asyncsweep_push(g, ctx, f->upvalues, sizeof(Upvaldesc) * f->sizeupvalues);
-        asyncsweep_push(g, ctx, f, sizeof(Proto));
-        return;
-      }
-      case LUA_TLCL: {
-        LClosure *cl = gco2lcl(o);
-        int i;
-        for (i = 0; i < cl->nupvalues; i++) {
-          UpVal *uv = cl->upvals[i];
-          if (uv) {
-            lua_assert(uv->refcount > 0);
-            uv->refcount--;
-            if (uv->refcount == 0 && !upisopen(uv))
-              asyncsweep_push(g, ctx, uv, sizeof(UpVal));
-          }
-        }
-        asyncsweep_push(g, ctx, cl, sizeLclosure(cl->nupvalues));
-        return;
-      }
-      case LUA_TCCL: {
-        asyncsweep_push(g, ctx, o, sizeCclosure(gco2ccl(o)->nupvalues));
-        return;
-      }
-      case LUA_TTABLE: {
-        Table *t = gco2t(o);
-        if (!isdummy(t))
-          asyncsweep_push(g, ctx, t->node, sizeof(Node) * cast(size_t, sizenode(t)));
-        if (t->array != NULL)
-          asyncsweep_push(g, ctx, t->array, sizeof(TValue) * t->sizearray);
-        asyncsweep_push(g, ctx, t, sizeof(Table));
-        return;
-      }
-      case LUA_TUSERDATA: {
-        asyncsweep_push(g, ctx, o, sizeudata(gco2u(o)));
-        return;
-      }
-      case LUA_TSHRSTR: {
-        luaS_remove(L, gco2ts(o));
-        asyncsweep_push(g, ctx, o, sizelstring(gco2ts(o)->shrlen));
-        return;
-      }
-      case LUA_TLNGSTR: {
-        asyncsweep_push(g, ctx, o, sizelstring(gco2ts(o)->u.lnglen));
-        return;
-      }
-      default: break;
-    }
-  }
-#endif
   switch (o->tt) {
     case LUA_TPROTO: luaF_freeproto(L, gco2p(o)); break;
     case LUA_TLCL: {
@@ -1485,7 +1237,6 @@ static void entersweep (lua_State *L) {
 
 void luaC_freeallobjects (lua_State *L) {
   global_State *g = G(L);
-  asyncsweep_flush(g);
   if (g->tobeswept != NULL) {
     *findlast(&g->tobeswept) = g->allgc;
     g->allgc = g->tobeswept;
@@ -1508,7 +1259,6 @@ void luaC_freeallobjects (lua_State *L) {
   sweepwholelist(L, &g->finobj);
   sweepwholelist(L, &g->allgc);
   sweepwholelist(L, &g->fixedgc);  /* collect fixed objects */
-  asyncsweep_shutdown(g);
   lua_assert(g->strt.nuse == 0);
 }
 
@@ -1756,7 +1506,6 @@ void luaC_fullgc (lua_State *L, int isemergency) {
   luaC_runtilstate(L, ~bitmask(GCSpause));  /* start new collection */
   luaC_runtilstate(L, bitmask(GCScallfin));  /* run up to finalizers */
   g->infullgc = 0;
-  asyncsweep_flush(g);
   /* estimate must be correct after a full GC cycle */
   lua_assert(g->GCestimate == gettotalbytes(g));
   luaC_runtilstate(L, bitmask(GCSpause));  /* finish collection */

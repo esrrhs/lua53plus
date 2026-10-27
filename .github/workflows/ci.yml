@@ -78,7 +78,7 @@ jobs:
             print("All sanity checks passed!")
           '
 
-      - name: Run benchmarks (default mode)
+      - name: Run benchmarks
         env:
           BENCH_RESIDENT_GROUPS: "20000"
           BENCH_TICKS_DEFAULT: "100000"
@@ -92,16 +92,4 @@ jobs:
         run: |
           ./src/lua bench/bench_gc_largeheap.lua
           ./src/lua bench/bench_table_lookup.lua
-          ./src/lua bench/bench_mixed_workload.lua
-
-      - name: Run benchmarks (async background sweep mode)
-        env:
-          LUA_ASYNC_SWEEP: "1"
-          BENCH_RESIDENT_GROUPS: "20000"
-          BENCH_TICKS_DEFAULT: "100000"
-          BENCH_TICKS_LOWPAUSE: "100000"
-          BENCH_ENTITIES: "10000"
-          BENCH_ROUNDS: "50000"
-        run: |
-          ./src/lua bench/bench_gc_largeheap.lua
           ./src/lua bench/bench_mixed_workload.lua

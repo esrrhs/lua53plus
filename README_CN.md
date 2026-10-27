@@ -4,7 +4,7 @@
 
 [English Documentation (README.md)](./README.md)
 
-**`lua53plus`** 是基于官方 **PUC-Lua 5.3.4** 深度优化的高性能增强版本，保持 **100% C API / ABI 与字节码无缝兼容**。
+**`lua53plus`** 是基于官方 **PUC-Lua 5.3.4** 深度优化的高性能纯单线程 C 增强版本，保持 **100% C API / ABI 与字节码无缝兼容**。
 
 本项目专为在 C/C++ 服务端进程中内嵌 Lua 5.3 VM、且存在**大体量常驻内存**（数百 MB 的长生命周期配置表、脚本函数原型、闭包与常驻状态）并持续处理高频请求（不断分配短生命周期临时表、密集执行短字符串 key 表查找）的生产场景设计。
 
@@ -21,7 +21,7 @@
 3. **`luaH_getshortstr` 与 `luaH_get` 查找开销：**
    标准 PUC-Lua 5.3.4 在每次虚拟机表访问（`OP_GETTABLE`、`OP_GETTABUP`、`OP_SELF`、`luaV_finishget`、`luaT_gettm`）时均需经由非内联的 `luaH_get` / `luaH_getstr` / `luaH_getshortstr` 函数调用，且先检查类型 tag 再比较指针，在高频短字符串字段访问下产生大量函数调用与分支预测开销。
 
-`lua53plus` 在**完全不改变公开结构体布局、C ABI 及预编译字节码兼容性**的前提下，从 GC 架构与表查找热路径两方面彻底解决了上述瓶颈。
+`lua53plus` 在**不引入任何外部依赖、完全不改变公开结构体布局、C ABI 及预编译字节码兼容性**的前提下，从 GC 架构与表查找热路径两方面彻底解决了上述瓶颈。
 
 ---
 
@@ -41,13 +41,7 @@
   - 下一次 Minor GC 启动（`restartcollection`）时，直接从 `g->grayagain`、`g->oldweak`（存活协程与弱表）及 `g->rembuf` 初始化根灰色集合，仅重新扫描被修改过的老年代容器。
   - 当老年代晋升对象数量相比上次 Major GC 增长超过 50%（`oldcount > lastmajcount * 1.5`）、显式调用 `collectgarbage("collect")` 或老年代对象动态设置 `__mode` 弱表元表时，自动执行 `mergeoldgen` 触发全量 Major GC，确保长周期下无内存泄漏。
 
-### 2. 可选后台并发清除线程（`LUA_ASYNC_SWEEP=1`）
-- 在 POSIX 平台（Linux / macOS）上，`src/lgc.c` 内置了可选的后台 pthread 异步释放工作线程（通过环境变量 `LUA_ASYNC_SWEEP=1` 开启）。
-- 在 `freeobj` 释放死亡对象时，Table 的数组区与哈希节点区、Closure、Proto、Userdata 及字符串内存块会先写入无锁的 256 项本地暂存区（Staging Buffer），批量推入 4096 槽位的环形队列，由后台 pthread 线程异步调用 `frealloc(ud, ptr, osize, 0)` 执行底层 `free`。
-- 短字符串全局哈希表摘除（`luaS_remove`）与 `GCdebt` 账目扣减仍在主 VM 线程同步完成，保证 100% 线程安全且主线程无锁竞争。
-- 在执行 `luaC_fullgc` 或关闭虚拟机 `lua_close`（`luaC_freeallobjects`）时，自动同步等待后台队列清空。
-
-### 3. 内联 `luaH_fastgetshortstr` 与缓存行友好的哈希冲突链（`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`）
+### 2. 内联 `luaH_fastgetshortstr` 与缓存行友好的哈希冲突链（`src/ltable.h`, `src/ltable.c`, `src/lvm.c`, `src/ltm.c`）
 - **内联快速路径（`luaH_fastgetshortstr` / `luaH_fastgetstr` / `luaH_fastget`）：**
   将短字符串哈希桶查找与整数数组下标边界检查内联至 `ltable.h`，直接在 `lvm.c`、`lapi.c` 和 `ltm.c` 的热路径中展开。
 - **优先比较短字符串唯一指针（Pointer-First Comparison）：**
@@ -67,14 +61,14 @@
 
 模拟服务端常驻大量长生命周期配置表/闭包，同时高频分配请求临时表（`req`、`payload`、`meta`）并读取常驻数据的场景：
 
-| 测试指标 | PUC-Lua 5.3.4 | `lua53plus` | `lua53plus` (`LUA_ASYNC_SWEEP=1`) | 提升幅度 |
-| :--- | :---: | :---: | :---: | :---: |
-| **45 MB 常驻堆 — 标准参数 (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3182 s (1,571K req/s)** | **0.3085 s (1,621K req/s)** | **吞吐量提升 +39% ～ +44%** |
-| **45 MB 常驻堆 — 低延迟参数 (`pause=110`)** | 0.4260 s (1,174K req/s) | **0.3109 s (1,608K req/s)** | **0.3210 s (1,558K req/s)** | **吞吐量提升 +37%** |
-| **171 MB 常驻堆 — 低延迟参数 (`pause=110`, 200万请求)** | 3.6575 s (547K req/s) | **1.5203 s (1,316K req/s)** | **1.5086 s (1,326K req/s)** | **吞吐量 2.42 倍（耗时降低 58.7%）** |
-| **GC 单步停顿延迟 — 平均值 (`collectgarbage("step", 64)`)** | 19.7 µs | **2.6 µs** | **2.6 µs** | **平均停顿降低 7.6 倍** |
-| **GC 单步停顿延迟 — P99** | 150.0 µs | **65.0 µs** | **66.0 µs** | **P99 停顿降低 2.3 倍** |
-| **GC 单步停顿延迟 — 最大毛刺 (45 MB / 171 MB 堆)** | 3.85 ms / 28.73 ms | **0.54 ms / 2.14 ms** | **0.51 ms / 2.10 ms** | **最大毛刺降低 7.1 ～ 13.4 倍** |
+| 测试指标 | PUC-Lua 5.3.4 | `lua53plus` | 提升幅度 |
+| :--- | :---: | :---: | :---: |
+| **45 MB 常驻堆 — 标准参数 (`pause=150`)** | 0.4430 s (1,128K req/s) | **0.3182 s (1,571K req/s)** | **吞吐量提升 +39.3%** |
+| **45 MB 常驻堆 — 低延迟参数 (`pause=110`)** | 0.4260 s (1,174K req/s) | **0.3109 s (1,608K req/s)** | **吞吐量提升 +37.0%** |
+| **171 MB 常驻堆 — 低延迟参数 (`pause=110`, 200万请求)** | 3.6575 s (547K req/s) | **1.5203 s (1,316K req/s)** | **吞吐量 2.41 倍（耗时降低 58.4%）** |
+| **GC 单步停顿延迟 — 平均值 (`collectgarbage("step", 64)`)** | 19.7 µs | **2.6 µs** | **平均停顿降低 7.6 倍** |
+| **GC 单步停顿延迟 — P99** | 150.0 µs | **65.0 µs** | **P99 停顿降低 2.3 倍** |
+| **GC 单步停顿延迟 — 最大毛刺 (45 MB / 171 MB 堆)** | 3.85 ms / 28.73 ms | **0.54 ms / 2.14 ms** | **最大毛刺降低 7.1 ～ 13.4 倍** |
 
 ### 2. CPU 热点占比剖析（130 MB 常驻堆下的 `perf record` 采样）
 
@@ -86,7 +80,7 @@
 | `luaV_execute`（有效字节码执行） | 5.59% | **38.44%** | CPU 算力从 GC 空转与查找开销回到业务字节码执行 |
 | **200 万次请求总耗时与峰值内存** | **3.005 s（峰值 151.5 MB）** | **2.087 s（峰值 132.2 MB）** | **提速 1.44 倍，且峰值内存降低 19.3 MB** |
 
-### 3. 短字符串表查找与综合业务负载（`bench/bench_table_lookup.lua`, `bench/bench_mixed_workload.lua`）
+### 3. 短字符串表查找与综合业务负载（`bench/bench_table_lookup.lua`, `bench/bench_mixed_workload.lua`)
 
 | 基准测试项 | PUC-Lua 5.3.4 | `lua53plus` | 性能提升 |
 | :--- | :---: | :---: | :---: |
@@ -120,11 +114,10 @@ make clean
 
 ### 在现有 C/C++ 项目中直接替换
 
-`lua53plus` 与标准 PUC-Lua 5.3.4 保持 **100% 头文件、C ABI 及二进制字节码兼容**：
+`lua53plus` 与标准 PUC-Lua 5.3.4 保持 **100% 头文件、C ABI、编译参数及二进制字节码兼容**：
 
 1. 将项目中原有的 `lua-5.3.4/src` 源码目录（或编译出的 `liblua.a`）替换为 `lua53plus/src`。
-2. 在 Linux / macOS 链接宿主程序时确保包含 `-lpthread`（使用 `make linux` 时已自动包含）。
-3. *(可选)* 运行时设置环境变量 `LUA_ASYNC_SWEEP=1` 即可启用后台线程异步 `free` 回收内存。
+2. 重新编译即可 —— 无需修改任何 C/C++ 宿主代码、链接参数或 Lua 脚本。
 
 ### 运行基准测试
 
@@ -132,9 +125,6 @@ make clean
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua
-
-# 开启后台并发清除线程运行基准测试：
-LUA_ASYNC_SWEEP=1 ./src/lua bench/bench_gc_largeheap.lua
 ```
 
 ---

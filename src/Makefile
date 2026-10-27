@@ -109,7 +109,7 @@ generic: $(ALL)
 READLINE_LIB= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-lreadline")
 
 linux:
-	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX" SYSLIBS="-Wl,-E -ldl -lpthread $(READLINE_LIB)"
+	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX" SYSLIBS="-Wl,-E -ldl $(READLINE_LIB)"
 
 macosx:
 	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_MACOSX" SYSLIBS="-lreadline" CC=cc
