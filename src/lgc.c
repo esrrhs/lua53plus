@@ -1443,11 +1443,20 @@ static void setpause (global_State *g) {
     l_mem minpause = cast(l_mem, g->GCestimate >> 4);
     if (minpause > cast(l_mem, GCSTEPSIZE * 4) && debt > -minpause)
       debt = -minpause;
-    if (!g->needmajor && g->GCestimate > 4 * 1024 * 1024) {
+    if (g->GCestimate > 4 * 1024 * 1024) {
       l_mem maxpause = cast(l_mem, g->GCestimate >> 3);
+      if (maxpause > 24 * 1024 * 1024)
+        maxpause = 24 * 1024 * 1024;
       if (debt < -maxpause)
         debt = -maxpause;
     }
+  }
+  else if (g->GCestimate > 16 * 1024 * 1024) {
+    l_mem maxpause = cast(l_mem, g->GCestimate >> 3);
+    if (maxpause > 24 * 1024 * 1024)
+      maxpause = 24 * 1024 * 1024;
+    if (debt < -maxpause)
+      debt = -maxpause;
   }
   luaE_setdebt(g, debt);
 }
@@ -1641,8 +1650,8 @@ static lu_mem singlestep (lua_State *L) {
       lua_assert(g->gray);
       propagatemark(g);
       if (g->gray == NULL) {  /* no more gray objects? */
-        if (!g->drainedgray && g->grayagain != NULL) {
-          g->drainedgray = 1;
+        if (g->drainedgray < 4 && g->grayagain != NULL) {
+          g->drainedgray++;
           g->gray = g->grayagain;
           g->grayagain = NULL;
         }
@@ -1758,8 +1767,11 @@ void luaC_step (lua_State *L) {
     lu_mem work = singlestep(L);  /* perform one single step */
     debt -= work;
     if ((oldstate == GCSatomic || g->gcstate == GCSatomic) &&
-        debt < cast(l_mem, gettotalbytes(g)))
+        debt < cast(l_mem, gettotalbytes(g))) {
+      if (debt > -GCSTEPSIZE)
+        debt = -GCSTEPSIZE;
       break;  /* isolate atomic phase into its own step */
+    }
   } while (debt > -GCSTEPSIZE && (g->gcstate != GCSpause || g->inbleach));
   if (g->gcstate == GCSpause && !g->inbleach)
     setpause(g);  /* pause until next cycle */

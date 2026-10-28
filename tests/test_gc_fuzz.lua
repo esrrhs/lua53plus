@@ -671,7 +671,112 @@ local function test_heavy_upval_and_grayagain_drain()
   io.write("OK\n")
 end
 
+-- Regression Test 5: GCSatomic debt isolation, multi-pass grayagain drain & large-heap setpause cap
+local function test_atomic_debt_and_large_heap_pause()
+  io.write("  [regression: GCSatomic debt clamp, multi-pass grayagain & >16MB setpause cap] ")
+  io.flush()
+  collectgarbage("collect")
+  collectgarbage("stop")
+
+  -- Part A: Verify collectgarbage("step", 1000) breaking at GCSatomic does not leave positive GCdebt
+  local garbage = {}
+  for i = 1, 15000 do
+    garbage[i] = { a = i, b = i + 1 }
+  end
+  local wt = setmetatable({ dead = { tag = "ephemeral" } }, { __mode = "v" })
+  garbage = nil
+
+  -- Step with 1000 KB until GCSatomic clears the weak table
+  local atomic_done = false
+  for _ = 1, 50 do
+    local finished = collectgarbage("step", 1000)
+    if wt.dead == nil then
+      atomic_done = true
+      assert(not finished, "GCSatomic should isolate before sweep finishes 15000 objects")
+      break
+    end
+  end
+  assert(atomic_done, "weak table should be cleared by GCSatomic")
+
+  -- Immediately after GCSatomic isolation break, GCdebt must be clamped to -GCSTEPSIZE (~-2.4KB),
+  -- NOT stacked at +1900KB. Therefore a tiny 1KB step must NOT trigger a massive sweep that finishes the cycle.
+  local tiny_finished = collectgarbage("step", 1)
+  assert(not tiny_finished, "leftover positive GCdebt leaked across GCSatomic isolation step!")
+  while not collectgarbage("step", 1000) do
+    if T then T.checkmemory() end
+  end
+
+  -- Part B: Multi-pass incremental grayagain draining when hot old tables are re-dirtied across propagate steps
+  local old_hot = {}
+  for i = 1, 400 do
+    old_hot[i] = { id = i, child = { v = i } }
+  end
+  while not collectgarbage("step", 500) do end
+
+  local young_chain = {}
+  for i = 1, 2000 do
+    young_chain[i] = { prev = young_chain[i - 1], idx = i }
+  end
+  for i = 1, 400 do
+    old_hot[i].child = { pass = 1, v = i * 10 }
+  end
+  local pass = 1
+  while not collectgarbage("step", 8) do
+    if pass < 4 then
+      pass = pass + 1
+      for i = 1, 400 do
+        old_hot[i].child = { pass = pass, v = i * 10 + pass }
+      end
+    end
+    if T then T.checkmemory() end
+  end
+  for i = 1, 400 do
+    assert(old_hot[i].child and old_hot[i].child.v == i * 10 + pass)
+  end
+  old_hot = nil
+  young_chain = nil
+
+  -- Part C: Verify setpause on a >16MB heap (both after collect and after Major GC) caps pause debt
+  local big_heap = {}
+  for i = 1, 60000 do
+    big_heap[i] = {
+      a = i, b = i * 2, c = i * 3, d = i * 4,
+      sub = { x = i, y = i + 1, s = "payload_" .. (i % 1024) }
+    }
+  end
+  -- Run full collect so GCestimate > 16MB
+  collectgarbage("collect")
+  collectgarbage("stop")
+  local heap_kb = collectgarbage("count")
+  assert(heap_kb > 16 * 1024, "expected >16MB live heap, got " .. tostring(heap_kb) .. "KB")
+
+  -- Trigger a Major GC cycle via needmajor (weak table in oldgen) and step to completion
+  local trig_wt = setmetatable({ k = {} }, { __mode = "v" })
+  while not collectgarbage("step", 1000) do end
+  -- Allocate ~4MB of temporary garbage (> GCestimate >> 3) while GC is stopped
+  local temp_alloc = {}
+  for i = 1, 20000 do
+    temp_alloc[i] = { x = i, y = i + 1, z = "tmp_" .. (i % 512) }
+  end
+  temp_alloc = nil
+  trig_wt.k = { ephemeral = true }
+  -- Because setpause capped maxpause at min(GCestimate >> 3, 24MB), allocating ~4MB already
+  -- paid off the pause debt, so manual step(1000) starts and completes a cycle promptly (within <= 35 steps)
+  local steps = 0
+  while not collectgarbage("step", 1000) do
+    steps = steps + 1
+    assert(steps < 60, "manual step(1000) stalled due to uncapped negative GCdebt on >16MB heap")
+  end
+  assert(trig_wt.k == nil, "cycle did not collect dead weak value")
+
+  big_heap = nil
+  collectgarbage("restart")
+  collectgarbage("collect")
+  io.write("OK\n")
+end
+
 print("=== Running Randomized Cross-Generation GC Fuzz Suite ===")
+test_atomic_debt_and_large_heap_pause()
 test_heavy_upval_and_grayagain_drain()
 test_finalizer_order_across_generations()
 test_inbleach_cross_reference_mutations()
