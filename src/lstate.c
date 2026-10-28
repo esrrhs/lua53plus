@@ -328,16 +328,19 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   g->gcfinnum = 0;
   g->gcpause = LUAI_GCPAUSE;
   g->gcstepmul = LUAI_GCMUL;
-  g->oldgc = g->oldfinobj = g->oldweak = NULL;
+  g->oldgc = g->oldfinobj = g->oldweak = g->grayatomic = NULL;
   g->fintail = NULL;
   g->tobeswept = g->tobesweptfin = NULL;
-  g->nrembuf = 0;
+  g->remuv = NULL;
+  g->remudata = NULL;
   g->minorcycles = 0;
   g->oldcount = g->lastmajcount = 0;
+  g->lastmajbytes = 0;
   g->ismajor = 1;
   g->needmajor = 0;
   g->infullgc = 0;
   g->inbleach = 0;
+  g->drainedgray = 0;
   for (i=0; i < LUA_NUMTAGS; i++) g->mt[i] = NULL;
   if (luaD_rawrunprotected(L, f_luaopen, NULL) != LUA_OK) {
     /* memory allocation error: free partial state */

@@ -80,7 +80,7 @@
 #define BLACKBIT	2  /* object is black */
 #define FINALIZEDBIT	3  /* object has been marked for finalization */
 #define OLDBIT		4  /* object is in old generation */
-#define WEAKBIT		5  /* table was marked as weak in current cycle */
+#define SURVIVALBIT	5  /* young object survived one GC cycle */
 #define TOUCHEDBIT	6  /* old object was touched by write barrier */
 /* bit 7 is currently used by tests (luaL_checkmemory) */
 

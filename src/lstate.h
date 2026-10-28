@@ -155,17 +155,20 @@ typedef struct global_State {
   GCObject *oldfinobj;  /* list of promoted old finalizable objects */
   GCObject **fintail;  /* tail cursor for in-order oldfinobj bleaching */
   GCObject *oldweak;  /* gclist of surviving threads and weak tables */
+  GCObject *grayatomic;  /* list of threads and weak tables for atomic phase */
   GCObject *tobeswept;  /* young objects to be swept in current cycle */
   GCObject *tobesweptfin;  /* young finobj to be swept in current cycle */
-  GCObject *rembuf[64];  /* remembered objects from barriers outside mark */
-  unsigned int nrembuf;  /* number of items in 'rembuf' */
+  UpVal *remuv;  /* remembered closed upvalues modified outside mark */
+  GCObject *remudata;  /* remembered old userdata modified outside mark */
   unsigned int minorcycles;  /* consecutive minor cycles since last major GC */
   lu_mem oldcount;  /* number of promoted objects in old generation */
   lu_mem lastmajcount;  /* 'oldcount' after last major GC */
+  lu_mem lastmajbytes;  /* live bytes after last major GC */
   lu_byte ismajor;  /* true if current cycle is a major GC */
   lu_byte needmajor;  /* true if next cycle must be a major GC */
   lu_byte infullgc;  /* true if inside luaC_fullgc */
   lu_byte inbleach;  /* true if incrementally bleaching oldgen in GCSpause */
+  lu_byte drainedgray;  /* number of incremental grayagain drains in propagate */
 } global_State;
 
 

@@ -601,7 +601,62 @@ local function test_gc_adversarial_edge_cases()
   io.write("OK\n")
 end
 
+-- Regression Test 4: High-volume closed-upvalue & userdata barriers during pause/sweep + incremental grayagain drain
+local function test_heavy_upval_and_grayagain_drain()
+  io.write("  [regression: unbounded remuv/remudata barriers & incremental grayagain drain] ")
+  io.flush()
+  collectgarbage("stop")
+
+  local closures = {}
+  local tables = {}
+  for i = 1, 500 do
+    local up = { val = i }
+    closures[i] = function(newv)
+      if newv ~= nil then up = newv end
+      return up
+    end
+    tables[i] = { id = i, slot = { x = i } }
+  end
+
+  -- Promote to old generation
+  while not collectgarbage("step", 200) do end
+  while not collectgarbage("step", 200) do end
+
+  -- While sitting in GCSpause, mutate >500 closed upvalues (>64 old rembuf limit),
+  -- create young weak tables, and dirty all 500 old tables multiple times
+  local wt_list = {}
+  for round = 1, 4 do
+    for i = 1, 500 do
+      closures[i]({ val = i * 10 + round, tag = "up_" .. i })
+      tables[i].slot = { x = i * 100 + round }
+    end
+    wt_list[round] = setmetatable({ ref = tables[round].slot }, { __mode = "v" })
+  end
+
+  if T then T.checkmemory() end
+
+  -- Step through the cycle incrementally and verify all values survive intact
+  while not collectgarbage("step", 16) do
+    if T then T.checkmemory() end
+  end
+
+  for i = 1, 500 do
+    local u = closures[i]()
+    assert(type(u) == "table" and u.val == i * 10 + 4, "closed upvalue lost across minor GC!")
+    assert(tables[i].slot and tables[i].slot.x == i * 100 + 4, "old table slot lost across minor GC!")
+  end
+  for round = 1, 3 do
+    assert(wt_list[round].ref == nil, "overwritten weak value should be collected!")
+  end
+  assert(wt_list[4].ref and wt_list[4].ref.x == 404)
+
+  collectgarbage("restart")
+  collectgarbage("collect")
+  io.write("OK\n")
+end
+
 print("=== Running Randomized Cross-Generation GC Fuzz Suite ===")
+test_heavy_upval_and_grayagain_drain()
 test_finalizer_order_across_generations()
 test_inbleach_cross_reference_mutations()
 test_gc_adversarial_edge_cases()

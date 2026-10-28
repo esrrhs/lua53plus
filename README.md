@@ -111,10 +111,10 @@ Whenever Lua mutates a ⚫Black object to reference a ⚪White object, a lightwe
 
 - **Case A: Mutating a container like a Table or Closure (`luaC_barrierback_` / `luaC_barrier_`)**:
   `lua53plus` turns `OldTable` from ⚫Black back to 🔘Gray, sets **`TOUCHEDBIT`** on it, and links it onto **`g->grayagain`** (our "Modified Logbook").
-  - Before the cycle finishes (`atomic`) and at the start of the next Minor GC (`restartcollection`), GC simply opens the `grayagain` logbook and scans **only the few old tables that were actually modified**, marking their new ⚪White children alive—without scanning the other 999,990 untouched old tables!
-  - Furthermore, while `OldTable` is 🔘Gray, repeated writes to `OldTable` don't even trigger the barrier again (zero overhead). Only when `OldTable` goes a full cycle without being touched does it return to ⚫Black.
-- **Case B: Forward barriers outside the mark phase (Userdata metatable / Closed Upvalue `rembuf`)**:
-  For objects without a `gclist` pointer (such as `userdata`) or closed upvalue writes outside the mark phase, the barrier records the target object in a small fixed-size remembered buffer `g->rembuf[64]`, which `restartcollection` marks at the start of the next cycle.
+  - Modified old tables stay 🔘Gray in `g->grayagain` throughout the main `GCSpropagate` phase so repeated mutations to hot old tables incur **zero barrier overhead** and never dirty the same table twice.
+  - Threads and weak tables are linked into a dedicated `g->grayatomic` list so `g->grayagain` holds only barrier-dirtied strong containers. Once `g->gray` finishes its normal root/young traversal, `GCSpropagate` swaps `g->grayagain` into `g->gray` (`g->drainedgray`) in `O(1)` time and drains all modified tables **incrementally across GC steps** before entering `GCSatomic` (without re-traversing threads or weak tables), while `luaC_step` isolates `GCSatomic` into its own step so atomic traversal never stacks onto propagation or sweep steps.
+- **Case B: Forward barriers outside the mark phase (Intrusive `remuv` / `remudata` lists)**:
+  For closed upvalue (`UpVal`) or userdata (`Udata`) mutations outside the mark phase, `lua53plus` links the modified `UpVal` or `Udata` into unbounded `O(1)` intrusive remembered lists (`g->remuv` and `g->remudata`). Repeated writes to the same upvalue or userdata are `O(1)` deduplicated no-ops, never overflow any fixed buffer, and only mark the latest live value at `restartcollection`.
 - **Case C: Weak Tables and Coroutines (`oldweak` list)**:
   Weak tables (`__mode = "k"` / `"v"`) and live coroutines (`lua_State` threads whose stacks change without write barriers) cannot be left ⚫Black. When they survive a cycle, `sweeptobeswept` links them onto a dedicated short list **`g->oldweak`** so `restartcollection` re-traverses them on every Minor GC.
 
@@ -127,9 +127,9 @@ Whenever Lua mutates a ⚫Black object to reference a ⚪White object, a lightwe
 Yes! That is why every generational collector periodically runs a **Major GC (Full-Heap Cleaning)** to reclaim old objects that have died.
 
 #### 1. When does `lua53plus` trigger a Major GC?
-- When the number of promoted old objects grows by more than **50%** since the last Major GC (`oldcount > lastmajcount * 1.5`);
-- When the user explicitly calls `collectgarbage("collect")`;
-- When a weak-mode metatable (`__mode`) is dynamically attached to an old table (`needmajor = 1`).
+- When post-sweep live heap bytes grow by more than **20%** (`GCestimate > lastmajbytes * 1.20`) or pre-GC total bytes exceed **1.33x** of `lastmajbytes`;
+- When the number of promoted old objects grows by more than **25%** since the last Major GC (`oldcount > lastmajcount * 1.25`), or after every **8 consecutive Minor GC cycles** (`minorcycles >= 8`) to guarantee dead old objects from temporary ramp-up peaks are promptly reclaimed;
+- When the user explicitly calls `collectgarbage("collect")`, or when a weak-mode metatable (`__mode`) is dynamically attached to a non-white table (`needmajor = 1`).
 
 #### 2. Why Lua 5.4's Generational GC (`KGC_GEN`) Still Spikes on Large Heaps
 In Lua 5.4's generational mode (`lgc.c`: `fullgen`), when the collector decides to run a Major GC, it executes a **synchronous, non-incremental stop-the-world pass**—bleaching, marking, and sweeping the entire multi-hundred-megabyte heap in a single step, causing tens of milliseconds of pause latency!

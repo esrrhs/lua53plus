@@ -35,6 +35,8 @@
 struct UpVal {
   TValue *v;  /* points to stack or to its own value */
   lu_mem refcount;  /* reference counter */
+  struct UpVal *remnext;  /* link in 'g->remuv' when closed and touched */
+  lu_byte inrem;  /* true if linked in 'g->remuv' */
   union {
     struct {  /* (when open) */
       UpVal *next;  /* linked list */

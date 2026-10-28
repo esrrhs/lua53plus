@@ -24,8 +24,9 @@
 */
 #define wgkey(n)		(&(n)->i_key.nk)
 
+#define TM_WEAKBIT		(1u << 6)
 #define TM_HASMODE		(1u << 7)
-#define invalidateTMcache(t)	((t)->flags &= cast_byte(TM_HASMODE))
+#define invalidateTMcache(t)	((t)->flags &= cast_byte(TM_HASMODE | TM_WEAKBIT))
 
 
 /* true when 't' is using 'dummynode' as its hash part */

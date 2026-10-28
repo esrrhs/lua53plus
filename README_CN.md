@@ -113,11 +113,10 @@ allgc: [临时对象1] -> [临时对象2] -> [常驻对象1] -> [常驻对象2] 
 ```
 
 - **情况 A：修改了老 Table / 老闭包（后向屏障 `luaC_barrierback_` / `luaC_barrier_`）**
-  一旦你往 `OldTable` 里塞了新对象，`lua53plus` 立刻把 `OldTable` 的牌子从⚫黑改成🔘灰，贴上 **`TOUCHEDBIT`（被碰过）** 标签，并把它挂到一个专门的小登记簿链表 **`grayagain`** 上。
-  - 在本轮 GC 的最后一步（`atomic`）以及下一轮 Minor GC 开始时（`restartcollection`），GC **只需要翻开 `grayagain` 这本小登记簿**，把里面记着的这几个被改过的老 Table 重新扫描一遍，就能把它们肚子里装的⚪白新对象全部标活！
-  - **连续修改的聪明优化**：如果某个老 Table 正在被频繁塞入新数据，每次塞数据因为它已经是🔘灰色了，不会重复触发写屏障（零开销）；而且只要它身上贴着 `TOUCHEDBIT`，本轮清扫时它会保持🔘灰态留任一轮，直到下一轮没人再改它，才自动恢复⚫黑牌免检状态！
-- **情况 B：在非标记阶段修改了 Userdata 元表或闭合 Upvalue（前向记忆集 `rembuf`）**
-  像 Userdata 这类没有 `gclist` 链表指针的对象，或者在清扫/暂停阶段修改了闭合 Upvalue，写屏障会把被写入的新对象指针直接记入一个固定大小的轻量级数组 `g->rembuf[64]`，在下一轮 GC 开始时直接标活（如果极罕见地塞满了 64 个，则自动标记 `needmajor = 1` 在下一轮做一次全量检查）。
+  一旦你往 `OldTable` 里塞了新对象，`lua53plus` 立刻把 `OldTable` 的牌子从⚫黑改成🔘灰，贴上 **`TOUCHEDBIT`（被碰过）** 标签，并把它挂到登记簿链表 **`grayagain`** 上。
+  - **单轮只扫一次 + 增量排空 `grayagain`**：在清扫/暂停期被改过的热表在 `restartcollection` 时继续留在 `grayagain` 保持🔘灰态，整个 `GCSpropagate` 主阶段对它们的成千上万次重复写入都是**零屏障开销**；同时将弱表与协程拆分为独立的 `g->grayatomic` 列表（使 `g->grayagain` 仅包含写屏障标脏的强引用对象）；当 `g->gray` 常规队列扫完后，在 `GCSpropagate` 内部以 `O(1)` 指针交换将 `grayagain` 转入 `g->gray` **分步增量扫描**（避免重复扫描弱表与协程栈），且 `luaC_step` 将 `GCSatomic` 隔离在独立步进中执行，彻底消除 `atomic` 阶段集中遍历脏表导致的单步长尾毛刺！
+- **情况 B：在非标记阶段修改了闭合 Upvalue 或 Userdata（无界侵入式链表 `remuv` / `remudata`）**
+  当在清扫/暂停阶段修改闭合 `UpVal` 或老 `Udata` 时，写屏障通过侵入式链表指针将 `UpVal` / `Udata` 直接挂入 `g->remuv` 与 `g->remudata`（通过 `inrem` / `TOUCHEDBIT` 标志实现 `O(1)` 去重，同一周期内改一万次也只登记一次，永不溢出且只在新一轮 `restartcollection` 时标记最新存活值）。
 - **情况 C：弱表（Weak Table）与协程栈（`oldweak` 专用链表）**
   弱表（带有 `__mode = "k"` 或 `"v"` 的表）和存活的协程（`lua_State` 线程，其运行栈随时在变）不能简单挂黑牌免检。`lua53plus` 在晋升时不会把它们放进 `oldgc`，而是用一条专门的短链表 **`oldweak`** 把它们串起来。每轮 Minor GC 启动时，顺着 `oldweak` 精准扫描这几个协程和弱表即可，既保证语义 100% 精确，又完全不用扫描那 100 万个普通老对象。
 
@@ -130,10 +129,10 @@ allgc: [临时对象1] -> [临时对象2] -> [常驻对象1] -> [常驻对象2] 
 没错！所以任何分代 GC 都需要定期做一次 **“全屋大扫除”（Major GC）**：把老年代里的对象也重新检查一遍，把已经死掉的老对象清理掉。
 
 #### 1. 什么时候触发大扫除（Major GC）？
-`lua53plus` 会在以下情况自动启动一次 Major GC：
-- 老年代对象总数比上一次大扫除后增长超过了 **50%**（`oldcount > lastmajcount * 1.5`）；
-- 用户显式调用了 `collectgarbage("collect")`；
-- 老年代对象在运行期动态绑定了包含 `__mode` 的弱表元表（`needmajor = 1`）。
+`lua53plus` 结合**真实存活字节数**与**周期上限**自动启动 Major GC：
+- Minor GC 清扫结束后的存活内存字节数比上一次 Major GC 基准增长超过 **20%**（`GCestimate > lastmajbytes * 1.20`），或 GC 启动前总内存超过 `lastmajbytes` 的 **1.33 倍**；
+- 老年代晋升对象数增长超过 **25%**（`oldcount > lastmajcount * 1.25`），或连续完成了 **8 轮 Minor GC**（`minorcycles >= 8`，确保即使启动期出现临时内存峰值，老年代中的死亡对象也能在最多 8 轮内被及时回收并下调基准线）；
+- 用户显式调用 `collectgarbage("collect")`，或对已存活的非白表动态挂载了包含 `__mode` 的弱表元表（`needmajor = 1`）。
 
 #### 2. 为什么 Lua 5.4 的分代 GC 在大扫除时还是会卡？
 很多人会问：Lua 5.4 不是也加了分代 GC（`KGC_GEN`）吗？
@@ -188,7 +187,7 @@ Step 2:  再搬 100 个...
 
 | 源码文件 | 核心改动说明 |
 | :--- | :--- |
-| `src/lgc.c`, `src/lgc.h` | 实现 `oldgc` / `oldfinobj` / `oldweak` 老年代隔离、`sweeptobeswept` 晋升、写屏障（`TOUCHEDBIT` + `grayagain` + `rembuf`）以及 `startbleach` / `bleachstep` 全增量 Major GC |
+| `src/lgc.c`, `src/lgc.h` | 实现 `oldgc` / `oldfinobj` / `oldweak` 老年代隔离、`sweeptobeswept` 晋升、写屏障（`TOUCHEDBIT` + `grayagain` + `remuv`/`remudata`）以及 `startbleach` / `bleachstep` 全增量 Major GC |
 | `src/lstate.h`, `src/lstate.c` | 在 `global_State` 内部末尾扩展老年代链表与增量漂白状态字段（完全不影响外部 C API / ABI） |
 | `src/ltable.h`, `src/ltable.c` | 实现内联 `luaH_fastgetshortstr` / `luaH_fastget`、指针优先比较、`getfreepos` 缓存行伙伴探测与 `luaH_resize` 直接插入 |
 | `src/lvm.c`, `src/lvm.h`, `src/ltm.c`, `src/lapi.c`, `src/lundump.c` | 虚拟机查表热路径切换至内联快速入口；补齐动态设置弱表 `__mode`、老 `Proto->cache` 闭包复用及字节码反序列化时的写屏障 |

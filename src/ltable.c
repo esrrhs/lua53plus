@@ -406,7 +406,7 @@ Table *luaH_new (lua_State *L) {
   GCObject *o = luaC_newobj(L, LUA_TTABLE, sizeof(Table));
   Table *t = gco2t(o);
   t->metatable = NULL;
-  t->flags = cast_byte(~TM_HASMODE);
+  t->flags = cast_byte(~(TM_HASMODE | TM_WEAKBIT));
   t->array = NULL;
   t->sizearray = 0;
   setnodevector(L, t, 0);
@@ -504,7 +504,8 @@ TValue *luaH_newkey (lua_State *L, Table *t, const TValue *key) {
   setnodekey(L, &mp->i_key, key);
   if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE]) {
     t->flags |= cast_byte(TM_HASMODE);
-    G(L)->needmajor = 1;
+    if (!iswhite(t))
+      G(L)->needmajor = 1;
   }
   luaC_barrierback(L, t, key);
   lua_assert(ttisnil(gval(mp)));

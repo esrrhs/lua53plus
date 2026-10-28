@@ -83,7 +83,7 @@
    ? (slot = NULL, 0) \
    : (slot = f(hvalue(t), k), \
      ttisnil(slot) ? 0 \
-     : (l_unlikely(hvalue(t)->flags & TM_HASMODE) ? (G(L)->needmajor = 1) : 0, \
+     : (l_unlikely((hvalue(t)->flags & TM_HASMODE) && !iswhite(hvalue(t))) ? (G(L)->needmajor = 1) : 0, \
         luaC_barrierback(L, hvalue(t), v), \
         setobj2t(L, cast(TValue *,slot), v), \
         1)))

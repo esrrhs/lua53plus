@@ -807,8 +807,11 @@ LUA_API void lua_rawset (lua_State *L, int idx) {
   slot = luaH_set(L, hvalue(o), L->top - 2);
   setobj2t(L, slot, L->top - 1);
   invalidateTMcache(hvalue(o));
-  if (ttisshrstring(L->top - 2) && tsvalue(L->top - 2) == G(L)->tmname[TM_MODE])
-    G(L)->needmajor = 1;
+  if (ttisshrstring(L->top - 2) && tsvalue(L->top - 2) == G(L)->tmname[TM_MODE]) {
+    hvalue(o)->flags |= cast_byte(TM_HASMODE);
+    if (!iswhite(hvalue(o)))
+      G(L)->needmajor = 1;
+  }
   luaC_barrierback(L, hvalue(o), L->top-1);
   L->top -= 2;
   lua_unlock(L);
@@ -860,9 +863,7 @@ LUA_API int lua_setmetatable (lua_State *L, int objindex) {
     case LUA_TTABLE: {
       hvalue(obj)->metatable = mt;
       if (mt) {
-        if ((isold(gcvalue(obj)) || G(L)->tobeswept != NULL ||
-             G(L)->tobesweptfin != NULL) &&
-            gfasttm(G(L), mt, TM_MODE) != NULL)
+        if (!iswhite(gcvalue(obj)) && gfasttm(G(L), mt, TM_MODE) != NULL)
           G(L)->needmajor = 1;
         luaC_objbarrier(L, gcvalue(obj), mt);
         luaC_checkfinalizer(L, gcvalue(obj), mt);

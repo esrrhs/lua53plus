@@ -347,6 +347,7 @@ typedef struct Udata {
   CommonHeader;
   lu_byte ttuv_;  /* user value's tag */
   struct Table *metatable;
+  GCObject *gclist;  /* link in 'g->remudata' when old and touched */
   size_t len;  /* number of bytes */
   union Value user_;  /* user value */
 } Udata;

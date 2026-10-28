@@ -47,6 +47,8 @@ void luaF_initupvals (lua_State *L, LClosure *cl) {
   for (i = 0; i < cl->nupvalues; i++) {
     UpVal *uv = luaM_new(L, UpVal);
     uv->refcount = 1;
+    uv->remnext = NULL;
+    uv->inrem = 0;
     uv->v = &uv->u.value;  /* make it closed */
     setnilvalue(uv->v);
     cl->upvals[i] = uv;
@@ -68,6 +70,8 @@ UpVal *luaF_findupval (lua_State *L, StkId level) {
   /* not found: create a new upvalue */
   uv = luaM_new(L, UpVal);
   uv->refcount = 0;
+  uv->remnext = NULL;
+  uv->inrem = 0;
   uv->u.open.next = *pp;  /* link it to list of open upvalues */
   uv->u.open.touched = 1;
   *pp = uv;

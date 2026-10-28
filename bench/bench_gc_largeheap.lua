@@ -102,8 +102,51 @@ local avg_us = sum_p / NUM_SAMPLES
 local p99_us = pauses[math.floor(NUM_SAMPLES * 0.99)]
 local max_us = pauses[NUM_SAMPLES]
 
+-- Phase D: Manual GC scheduler (collectgarbage("stop") + threshold-triggered step(1000))
+-- under heavy old-table write-barrier and closed-upvalue mutation pressure
+collectgarbage("stop")
+while not collectgarbage("step", 1000) do end
+local base_kb = collectgarbage("count")
+local in_gc = false
+local step_ms_list = {}
+local cycle_cpu_ms = 0
+local cycles_done = 0
+local MANUAL_TICKS = math.min(TICKS_DEFAULT, 20000)
+local THRESH_KB = math.max(4096, math.floor(base_kb * 0.10))
+
+for tick = 1, MANUAL_TICKS do
+  local base_idx = ((tick * 37) % math.max(1, RESIDENT_GROUPS - 32)) + 1
+  for k = 0, 23 do
+    local entry = resident[base_idx + k]
+    local msg = { seq = tick + k, v = tick * 2 }
+    entry.primary.hot = msg
+    if k < 4 then
+      acc = acc + entry.fn(tick)
+    end
+  end
+  if in_gc then
+    local s0 = os.clock()
+    local done = collectgarbage("step", 1000)
+    local dt_ms = (os.clock() - s0) * 1000.0
+    cycle_cpu_ms = cycle_cpu_ms + dt_ms
+    step_ms_list[#step_ms_list + 1] = dt_ms
+    if done then
+      in_gc = false
+      cycles_done = cycles_done + 1
+      base_kb = collectgarbage("count")
+    end
+  elseif collectgarbage("count") - base_kb >= THRESH_KB then
+    in_gc = true
+  end
+end
+table.sort(step_ms_list)
+local manual_p99_ms = #step_ms_list > 0 and step_ms_list[math.max(1, math.floor(#step_ms_list * 0.99))] or 0
+local manual_max_ms = #step_ms_list > 0 and step_ms_list[#step_ms_list] or 0
+
 assert(acc > 0)
 io.write(string.format("RESULT gc_standard_pause_sec: %.4f (%.0f req/s)\n", dt_default, TICKS_DEFAULT / dt_default))
 io.write(string.format("RESULT gc_low_pause_sec:      %.4f (%.0f req/s)\n", dt_lowpause, TICKS_LOWPAUSE / dt_lowpause))
 io.write(string.format("RESULT gc_total_sec:          %.4f\n", dt_default + dt_lowpause))
 io.write(string.format("RESULT gc_step_pause_us:      avg=%.1f p99=%.1f max=%.1f\n", avg_us, p99_us, max_us))
+io.write(string.format("RESULT gc_manual_step1000_ms: cycles=%d total_gc=%.1fms p99=%.2fms max=%.2fms\n",
+  cycles_done, cycle_cpu_ms, manual_p99_ms, manual_max_ms))
