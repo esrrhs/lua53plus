@@ -596,6 +596,22 @@ local function test_gc_adversarial_edge_cases()
     assert(order[1] == "B" and order[2] == "A")
   end
 
+  -- 3g. Finalization order when old object in oldgc is given __gc during GCSpause before incremental bleach
+  do
+    collectgarbage("stop")
+    local order = {}
+    local gc_mt = { __gc = function(self) order[#order + 1] = self.name end }
+    local A = { name = "A" }
+    while not collectgarbage("step", 200) do end
+    setmetatable(A, gc_mt)
+    local B = setmetatable({ name = "B" }, gc_mt)
+    while not collectgarbage("step", 200) do end
+    A, B = nil, nil
+    collectgarbage("collect")
+    assert(order[1] == "B" and order[2] == "A")
+    collectgarbage("restart")
+  end
+
   resident = nil
   collectgarbage("collect")
   io.write("OK\n")

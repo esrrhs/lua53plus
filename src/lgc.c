@@ -361,6 +361,23 @@ static void markbeingfnz (global_State *g) {
     markobject(g, o);
 }
 
+static void markoldweak (global_State *g) {
+  GCObject *o = g->oldweak;
+  g->oldweak = NULL;
+  while (o != NULL) {
+    GCObject *next = *getgclist(o);
+    if (g->oldcount > 0)
+      g->oldcount--;
+    if (o->tt == LUA_TTABLE)
+      gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
+    resetbits(o->marked, bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
+                         bitmask(TOUCHEDBIT) | bitmask(7));
+    if (iswhite(o))
+      reallymarkobject(g, o);
+    o = next;
+  }
+}
+
 
 /*
 ** Mark all values stored in marked open upvalues from non-marked threads.
@@ -428,7 +445,7 @@ static void clearremlists (global_State *g, int mark) {
     g->remudata = gco2u(u)->gclist;
     gco2u(u)->gclist = NULL;
     resetbit(u->marked, TOUCHEDBIT);
-    if (mark && isold(u)) {
+    if (mark && !isdead(g, u)) {
       TValue uvalue;
       markobjectN(g, gco2u(u)->metatable);
       getuservalue(g->mainthread, gco2u(u), &uvalue);
@@ -578,7 +595,6 @@ static void mergeoldgen (global_State *g) {
 ** and each hot table is traversed only once near the end of 'GCSpropagate'.
 */
 static void restartcollection (global_State *g) {
-  GCObject *o;
   g->gray = NULL;
   g->grayatomic = NULL;
   g->drainedgray = 0;
@@ -589,20 +605,7 @@ static void restartcollection (global_State *g) {
   markmt(g);
   markbeingfnz(g);  /* mark any finalizing object left from previous cycle */
   /* mark surviving threads and weak tables from previous minor cycle */
-  o = g->oldweak;
-  g->oldweak = NULL;
-  while (o != NULL) {
-    GCObject *next = *getgclist(o);
-    if (g->oldcount > 0)
-      g->oldcount--;
-    if (o->tt == LUA_TTABLE)
-      gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
-    resetbits(o->marked, bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                         bitmask(TOUCHEDBIT) | bitmask(7));
-    if (iswhite(o))
-      reallymarkobject(g, o);
-    o = next;
-  }
+  markoldweak(g);
   /* mark remembered values from barriers outside mark phase */
   clearremlists(g, 1);
 }
@@ -1338,15 +1341,32 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
           }
           if (o->tt == LUA_TTABLE)
             gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
-          o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                      bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                      bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
-          if (g->inbleach && g->finobj == NULL)
-            g->fintail = &o->next;
-          o->next = g->finobj;
-          g->finobj = o;
-          if (!g->inbleach)
+          if (g->inbleach) {
+            o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                        bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
+                        bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+            if (g->finobj == NULL)
+              g->fintail = &o->next;
+            o->next = g->finobj;
+            g->finobj = o;
+          }
+          else if (g->tobesweptfin != NULL) {
+            o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                        bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
+                        bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+            o->next = g->finobj;
+            g->finobj = o;
             g->needmajor = 1;
+          }
+          else {
+            o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(SURVIVALBIT) |
+                        bitmask(TOUCHEDBIT) | bitmask(7))) |
+                        bitmask(BLACKBIT) | bitmask(OLDBIT) | bitmask(FINALIZEDBIT));
+            o->next = g->oldfinobj;
+            g->oldfinobj = o;
+            g->oldcount++;
+            g->needmajor = 1;
+          }
         }
         return;
       }
@@ -1509,6 +1529,7 @@ static l_mem atomic (lua_State *L) {
   /* registry and global metatables may be changed by API */
   markvalue(g, &g->l_registry);
   markmt(g);  /* mark global metatables */
+  markoldweak(g);
   /* remark occasional upvalues of (maybe) dead threads */
   remarkupvals(g);
   propagateall(g);  /* propagate changes */
