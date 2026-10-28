@@ -248,6 +248,7 @@ This produces:
 
 # Run benchmarks
 ./src/lua bench/bench_gc_largeheap.lua
+./src/lua bench/bench_gc_manualstep.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua
 ```
