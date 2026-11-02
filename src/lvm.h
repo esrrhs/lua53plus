@@ -76,14 +76,22 @@
 ** return false with 'slot' equal to NULL (if 't' is not a table) or
 ** 'nil'. (This is needed by 'luaV_finishget'.) Note that, if the macro
 ** returns true, there is no need to 'invalidateTMcache', because the
-** call is not creating a new entry.
+** call is not creating a new entry. If the existing key is __mode
+** (G(L)->tmname[TM_MODE]), set TM_HASMODE and needmajor when the table
+** is not white — same rule as luaH_newkey / luaV_finishset.
 */
 #define luaV_fastset(L,t,k,slot,f,v) \
   (!ttistable(t) \
    ? (slot = NULL, 0) \
    : (slot = f(hvalue(t), k), \
      ttisnil(slot) ? 0 \
-     : (l_unlikely((hvalue(t)->flags & TM_HASMODE) && !iswhite(hvalue(t))) ? (G(L)->needmajor = 1) : 0, \
+     : (l_unlikely(!iswhite(hvalue(t)) && \
+                   !((hvalue(t))->sizearray > 0 && \
+                     (hvalue(t))->array <= (slot) && \
+                     (slot) < (hvalue(t))->array + (hvalue(t))->sizearray) && \
+                   ttisshrstring(keyfromval(slot)) && \
+                   tsvalue(keyfromval(slot)) == G(L)->tmname[TM_MODE]) \
+          ? ((hvalue(t))->flags |= cast_byte(TM_HASMODE), G(L)->needmajor = 1) : 0, \
         luaC_barrierback(L, hvalue(t), v), \
         setobj2t(L, cast(TValue *,slot), v), \
         1)))

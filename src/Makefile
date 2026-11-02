@@ -106,10 +106,12 @@ freebsd:
 
 generic: $(ALL)
 
+# Same probe gates both -DLUA_USE_READLINE (luaconf) and -lreadline.
+READLINE_CFLAGS= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-DLUA_USE_READLINE")
 READLINE_LIB= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-lreadline")
 
 linux:
-	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX" SYSLIBS="-Wl,-E -ldl $(READLINE_LIB)"
+	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX $(READLINE_CFLAGS)" SYSLIBS="-Wl,-E -ldl $(READLINE_LIB)"
 
 macosx:
 	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_MACOSX" SYSLIBS="-lreadline" CC=cc

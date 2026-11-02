@@ -11,6 +11,17 @@
 local debug = require("debug")
 local T = rawget(_G, "T")
 
+-- Optional bare-userdata helper (tests/t_udata.so) for remudata/tobeswept coverage
+local UdataHelper = nil
+do
+  local dir = (debug.getinfo(1, "S").source:match("^@(.*)/") or ".")
+  local so = dir .. "/t_udata.so"
+  local opener = package.loadlib(so, "luaopen_t_udata")
+  if type(opener) == "function" then
+    UdataHelper = opener()
+  end
+end
+
 -- Deterministic LCG PRNG so every seed is 100% reproducible across platforms
 local rng_state = 1
 local function seed_rng(s)
@@ -478,9 +489,9 @@ local function run_fuzz_round(seed, manual_gc_mode, num_ops)
   io.write(string.format("OK (finalized=%d, post_gc_kb=%.1f)\n", finalized_count, final_kb))
 end
 
--- Regression Test 3: Edge cases across lundump, tobeswept/tobefnz barriers, and TM_HASMODE fastset
+-- Regression Test 3: Edge cases across lundump, tobeswept/tobefnz barriers, and __mode via fastset
 local function test_gc_adversarial_edge_cases()
-  io.write("  [regression: stripped undump barrier, tobeswept/tobefnz barriers & TM_HASMODE fastset] ")
+  io.write("  [regression: stripped undump barrier, tobeswept/tobefnz/remudata & __mode fastset] ")
   io.flush()
 
   -- 3a. Stripped precompiled chunk with GC triggered inside lua_Reader while Proto is black & source is NULL
@@ -564,7 +575,8 @@ local function test_gc_adversarial_edge_cases()
     assert(o.v == nil)
   end
 
-  -- 3e. Existing non-nil mt.__mode mutated in-place via luaV_fastset (TM_HASMODE)
+  -- 3e. Existing non-nil mt.__mode mutated in-place via luaV_fastset
+  -- (needmajor/TM_HASMODE only when the written key is __mode on a non-white table)
   do
     local v_str = "v"
     local mt = { __mode = false }
@@ -575,6 +587,29 @@ local function test_gc_adversarial_edge_cases()
     val = nil
     while not collectgarbage("step", 0) do end
     assert(o.v == nil)
+  end
+
+  -- 3e2. Same fastset __mode path while table is non-white (propagate/atomic): sets needmajor
+  do
+    local mt = { __mode = false, anchor = true }
+    local o = setmetatable({ v = { "keep" } }, mt)
+    collectgarbage("collect")
+    collectgarbage("stop")
+    local pad = {}
+    for i = 1, 3000 do pad[i] = { i } end
+    -- Mutate __mode across many incremental steps so at least one write hits a black mt
+    for s = 1, 4000 do
+      collectgarbage("step", 0)
+      mt.__mode = (s % 2 == 0) and "v" or false
+    end
+    collectgarbage("restart")
+    local val = { "collect_me_fastset_black" }
+    o.v = val
+    mt.__mode = "v"
+    val = nil
+    while not collectgarbage("step", 0) do end
+    assert(o.v == nil)
+    pad = nil
   end
 
   -- 3f. Finalization order when object in tobeswept is given __gc during GCSswpallgc after finobj/tobesweptfin
@@ -610,6 +645,30 @@ local function test_gc_adversarial_edge_cases()
     collectgarbage("collect")
     assert(order[1] == "B" and order[2] == "A")
     collectgarbage("restart")
+  end
+
+  -- 3h. Userdata in tobeswept with TOUCHEDBIT/remudata then given __gc (luaC_checkfinalizer remudata unlink)
+  -- Requires tests/t_udata.so (bare userdata without a prior finalizer).
+  if UdataHelper then
+    local u = UdataHelper.new(32)
+    local pad = {}
+    for i = 1, 2000 do pad[i] = { i } end
+    local registered = false
+    setmetatable({}, { __gc = function()
+      UdataHelper.setuv(u, { touch = true })  -- barrier -> TOUCHEDBIT + remudata during sweep
+      debug.setmetatable(u, { __gc = function() registered = true end })
+    end })
+    local steps = 0
+    while debug.getmetatable(u) == nil and steps < 30000 do
+      collectgarbage("step", 0)
+      steps = steps + 1
+    end
+    assert(debug.getmetatable(u) ~= nil, "userdata __gc should be attached during tobeswept sweep")
+    u = nil
+    pad = nil
+    collectgarbage("collect")
+    collectgarbage("collect")
+    assert(registered, "userdata finalizer from tobeswept+remudata path should run")
   end
 
   resident = nil

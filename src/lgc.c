@@ -1387,27 +1387,30 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
     }
     else {
       /* 'o' is in 'tobeswept' waiting to be promoted */
-      for (p = &g->tobeswept; *p != o; p = &(*p)->next) { /* empty */ }
-      *p = o->next;
-      if (testbit(o->marked, TOUCHEDBIT)) {
-        GCObject **pg;
-        if (o->tt == LUA_TUSERDATA) {
-          for (pg = &g->remudata; *pg != NULL && *pg != o; pg = &gco2u(*pg)->gclist) { /* empty */ }
-          if (*pg == o) *pg = gco2u(o)->gclist;
+      for (p = &g->tobeswept; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
+      lua_assert(*p == o);
+      if (*p == o) {
+        *p = o->next;
+        if (testbit(o->marked, TOUCHEDBIT)) {
+          GCObject **pg;
+          if (o->tt == LUA_TUSERDATA) {
+            for (pg = &g->remudata; *pg != NULL && *pg != o; pg = &gco2u(*pg)->gclist) { /* empty */ }
+            if (*pg == o) *pg = gco2u(o)->gclist;
+          }
+          else {
+            for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
+            if (*pg == o) *pg = *getgclist(o);
+          }
         }
-        else {
-          for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
-          if (*pg == o) *pg = *getgclist(o);
-        }
+        if (o->tt == LUA_TTABLE)
+          gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
+        o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                    bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
+                    bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+        o->next = g->finobj;
+        g->finobj = o;
+        g->needmajor = 1;
       }
-      if (o->tt == LUA_TTABLE)
-        gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
-      o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                  bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                  bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
-      o->next = g->finobj;
-      g->finobj = o;
-      g->needmajor = 1;
     }
   }
 }
