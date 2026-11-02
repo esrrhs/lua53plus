@@ -25,6 +25,10 @@ jobs:
         run: |
           make ${{ matrix.target }} MYCFLAGS='-DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert'
 
+      - name: Run language/stdlib e2e suite (with lua_assert)
+        run: |
+          ./src/lua tests/e2e/run_all.lua
+
       - name: Run randomized cross-generation GC fuzz suite (with lua_assert)
         run: |
           ./src/lua tests/test_gc_fuzz.lua
@@ -35,6 +39,10 @@ jobs:
           make ${{ matrix.target }}
           ./src/lua -v
           ./src/luac -v
+
+      - name: Run language/stdlib e2e suite (release build)
+        run: |
+          ./src/lua tests/e2e/run_all.lua
 
       - name: Run randomized cross-generation GC fuzz suite (release build)
         run: |

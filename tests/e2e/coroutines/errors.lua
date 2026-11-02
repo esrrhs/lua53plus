@@ -1,0 +1,35 @@
+local H = require("harness")
+
+H.case("error across resume", function()
+  local co = coroutine.create(function()
+    error("boom")
+  end)
+  local ok, err = coroutine.resume(co)
+  H.eq(ok, false)
+  H.ok(tostring(err):find("boom"))
+  H.eq(coroutine.status(co), "dead")
+end)
+
+H.case("yield across pcall", function()
+  local co = coroutine.create(function()
+    local ok, v = pcall(function()
+      return coroutine.yield(42)
+    end)
+    return ok, v
+  end)
+  local ok, v = coroutine.resume(co)
+  H.ok(ok); H.eq(v, 42)
+  ok, v = coroutine.resume(co, true, "back")
+  -- After resume into yield inside pcall: returns ok,v from outer
+  H.ok(ok)
+  -- v is first return from co body after resume: ok from pcall
+  H.eq(v, true)
+end)
+
+H.case("resume dead coroutine fails", function()
+  local co = coroutine.create(function() end)
+  coroutine.resume(co)
+  local ok, err = coroutine.resume(co)
+  H.eq(ok, false)
+  H.ok(tostring(err):find("dead") or tostring(err):find("cannot resume"))
+end)

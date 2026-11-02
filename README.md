@@ -243,6 +243,9 @@ This produces:
 ### Running Tests & Benchmarks
 
 ```bash
+# Language / stdlib end-to-end suite (excludes GC; also: make test-e2e)
+./src/lua tests/e2e/run_all.lua
+
 # Run randomized cross-generation GC & write-barrier fuzz test suite
 ./src/lua tests/test_gc_fuzz.lua
 

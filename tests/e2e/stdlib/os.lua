@@ -1,0 +1,25 @@
+local H = require("harness")
+
+H.case("safe os clock date time difftime", function()
+  H.ok(os.clock() >= 0)
+  local t = os.time({year=2000, month=1, day=1, hour=12, min=0, sec=0})
+  H.ok(type(t) == "number")
+  -- os.time table is local; use local "*t" for round-trip
+  local d = os.date("*t", t)
+  H.eq(d.year, 2000)
+  H.eq(d.month, 1)
+  H.eq(d.day, 1)
+  H.eq(os.difftime(t + 10, t), 10)
+  H.ok(type(os.date("%Y", t)) == "string")
+  -- UTC formatter returns a string without depending on local TZ for format presence
+  H.ok(type(os.date("!%Y-%m-%d", t)) == "string")
+end)
+
+H.case("tmpname getenv setlocale read", function()
+  local p = os.tmpname()
+  H.ok(type(p) == "string" and #p > 0)
+  local g = os.getenv("PATH")
+  H.ok(g == nil or type(g) == "string")
+  local loc = os.setlocale(nil)
+  H.ok(type(loc) == "string")
+end)

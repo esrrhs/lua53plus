@@ -264,6 +264,7 @@ make clean
 
 ```bash
 # 运行新老年代随机交叉引用与写屏障 Fuzz 测试套件
+./src/lua tests/e2e/run_all.lua
 ./src/lua tests/test_gc_fuzz.lua
 
 # 运行基准测试

@@ -57,6 +57,10 @@ $(PLATS) clean:
 test:	dummy
 	src/lua -v
 
+# Language / stdlib e2e (excludes GC fuzz; see tests/test_gc_fuzz.lua)
+test-e2e:	dummy
+	src/lua tests/e2e/run_all.lua
+
 install: dummy
 	cd src && $(MKDIR) $(INSTALL_BIN) $(INSTALL_INC) $(INSTALL_LIB) $(INSTALL_MAN) $(INSTALL_LMOD) $(INSTALL_CMOD)
 	cd src && $(INSTALL_EXEC) $(TO_BIN) $(INSTALL_BIN)
@@ -109,6 +113,6 @@ pc:
 	@echo "includedir=$(INSTALL_INC)"
 
 # list targets that do not create files (but not all makes understand .PHONY)
-.PHONY: all $(PLATS) clean test install local none dummy echo pecho lecho
+.PHONY: all $(PLATS) clean test test-e2e install local none dummy echo pecho lecho
 
 # (end of Makefile)
