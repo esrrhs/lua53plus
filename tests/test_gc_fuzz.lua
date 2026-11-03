@@ -2,7 +2,7 @@
 -- Exercises:
 --   1. Old <-> Young table cross-references (values, keys, array part, hash part, rehash during every GC phase)
 --   2. Multi-hop generational chains (old -> old -> young -> young) & repeated grayagain (TOUCHEDBIT) overwrites
---   3. Closures, Protos (p->cache reuse), and Open/Closed Upvalues across coroutines & debug.setupvalue/upvaluejoin
+--   3. Closures, Protos (p->cache reuse; white caches dropped on traverse), and Open/Closed Upvalues across coroutines & debug.setupvalue/upvaluejoin
 --   4. Weak tables (__mode = "k", "v", "kv", ephemerons) and dynamic mid-cycle setmetatable(old_tab, weak_mt)
 --   5. Finalizers (__gc) attached to young, old, and tobeswept objects, resurrection into old tables,
 --      and strict reverse-creation finalization order across Minor + Incremental-Bleach Major GC cycles
@@ -321,7 +321,7 @@ local function run_fuzz_round(seed, manual_gc_mode, num_ops)
       target.active_co = co
 
     elseif op == 6 then
-      -- Old Proto instantiating closures & reusing p->cache
+      -- Proto instantiating closures (cache only retained while Proto is non-black)
       local pf = proto_factories[(step % #proto_factories) + 1]
       local c1 = pf({ a = step }, "b_" .. step)
       local c2 = pf({ a = step + 1 }, "b_" .. step)

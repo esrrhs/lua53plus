@@ -61,6 +61,23 @@ test:	dummy
 test-e2e:	dummy
 	src/lua tests/e2e/run_all.lua
 
+# Optional bare-userdata helper for GC fuzz (ignored by git as *.so)
+tests/t_udata.so: tests/t_udata.c src/lua.h src/lauxlib.h
+	gcc -std=gnu99 -O2 -fPIC -Isrc -shared -o $@ tests/t_udata.c
+
+test-udata: tests/t_udata.so
+
+# Official PUC-Lua 5.3.4 testes (fetch first: scripts/fetch_testes.sh)
+test-testes-basic:	dummy
+	@test -f testes/all.lua || { echo "missing testes/; run scripts/fetch_testes.sh"; exit 1; }
+	cd testes && ../src/lua -e'_U=true' all.lua
+
+test-testes:	dummy
+	@test -f testes/all.lua || { echo "missing testes/; run scripts/fetch_testes.sh"; exit 1; }
+	@test -f src/lua || { echo "build interpreter first (e.g. make linux)"; exit 1; }
+	cd testes/libs && $(MAKE) LUA_DIR=../../src
+	cd testes && ../src/lua -e'_port=true' all.lua
+
 install: dummy
 	cd src && $(MKDIR) $(INSTALL_BIN) $(INSTALL_INC) $(INSTALL_LIB) $(INSTALL_MAN) $(INSTALL_LMOD) $(INSTALL_CMOD)
 	cd src && $(INSTALL_EXEC) $(TO_BIN) $(INSTALL_BIN)
@@ -113,6 +130,6 @@ pc:
 	@echo "includedir=$(INSTALL_INC)"
 
 # list targets that do not create files (but not all makes understand .PHONY)
-.PHONY: all $(PLATS) clean test test-e2e install local none dummy echo pecho lecho
+.PHONY: all $(PLATS) clean test test-e2e test-udata test-testes-basic test-testes install local none dummy echo pecho lecho
 
 # (end of Makefile)

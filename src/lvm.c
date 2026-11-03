@@ -653,7 +653,10 @@ static void pushclosure (lua_State *L, Proto *p, UpVal **encup, StkId base,
   if (!isblack(p))  /* cache will not break GC invariant? */
     p->cache = ncl;  /* save it on cache for reuse */
   else if (isold(p)) {
-    p->cache = ncl;  /* save it on cache and schedule proto re-check */
+    /* Old Protos stay black across minor cycles. Cache is a weak-ish
+       optimization: barrier marks the young closure (forward) while
+       traverseproto only drops white caches, so reuse stays effective. */
+    p->cache = ncl;
     luaC_objbarrier(L, p, ncl);
   }
 }

@@ -14,8 +14,10 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux
+            run_full_testes: true
           - os: macos-latest
             target: macosx
+            run_full_testes: false
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
@@ -25,6 +27,10 @@ jobs:
         run: |
           make ${{ matrix.target }} MYCFLAGS='-DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert'
 
+      - name: Build tests/t_udata.so for GC fuzz userdata paths
+        run: |
+          make test-udata
+
       - name: Run language/stdlib e2e suite (with lua_assert)
         run: |
           ./src/lua tests/e2e/run_all.lua
@@ -33,12 +39,30 @@ jobs:
         run: |
           ./src/lua tests/test_gc_fuzz.lua
 
+      - name: Fetch official PUC-Lua 5.3.4 testes
+        run: |
+          ./scripts/fetch_testes.sh
+
+      - name: Run official testes (basic _U=true)
+        run: |
+          make test-testes-basic
+
+      - name: Rebuild with ltests + run complete official testes
+        if: matrix.run_full_testes
+        run: |
+          ./scripts/build_with_ltests.sh ${{ matrix.target }}
+          make test-testes
+
       - name: Rebuild clean release binaries
         run: |
           make clean
           make ${{ matrix.target }}
           ./src/lua -v
           ./src/luac -v
+
+      - name: Build tests/t_udata.so (release)
+        run: |
+          make test-udata
 
       - name: Run language/stdlib e2e suite (release build)
         run: |
@@ -47,6 +71,11 @@ jobs:
       - name: Run randomized cross-generation GC fuzz suite (release build)
         run: |
           ./src/lua tests/test_gc_fuzz.lua
+
+      - name: Run official testes basic on release build
+        run: |
+          test -f testes/all.lua || ./scripts/fetch_testes.sh
+          make test-testes-basic
 
       - name: Run benchmarks & manual-step large-heap simulation
         env:

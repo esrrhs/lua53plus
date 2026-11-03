@@ -101,20 +101,21 @@ c89:
 	@echo ''
 
 
-freebsd:
-	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX" SYSLIBS="-Wl,-E -lreadline"
-
-generic: $(ALL)
-
 # Same probe gates both -DLUA_USE_READLINE (luaconf) and -lreadline.
+# Shared by linux / macosx / freebsd so missing readline never breaks the build.
 READLINE_CFLAGS= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-DLUA_USE_READLINE")
 READLINE_LIB= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-lreadline")
+
+freebsd:
+	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX $(READLINE_CFLAGS)" SYSLIBS="-Wl,-E $(READLINE_LIB)"
+
+generic: $(ALL)
 
 linux:
 	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX $(READLINE_CFLAGS)" SYSLIBS="-Wl,-E -ldl $(READLINE_LIB)"
 
 macosx:
-	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_MACOSX" SYSLIBS="-lreadline" CC=cc
+	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_MACOSX $(READLINE_CFLAGS)" SYSLIBS="$(READLINE_LIB)" CC=cc
 
 mingw:
 	$(MAKE) "LUA_A=lua53.dll" "LUA_T=lua.exe" \

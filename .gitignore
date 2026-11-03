@@ -6,3 +6,6 @@ src/lua
 src/luac
 src/liblua.a
 luac.out
+
+# Official PUC-Lua testes (fetched by scripts/fetch_testes.sh)
+/testes/

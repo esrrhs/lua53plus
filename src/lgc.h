@@ -80,9 +80,9 @@
 #define BLACKBIT	2  /* object is black */
 #define FINALIZEDBIT	3  /* object has been marked for finalization */
 #define OLDBIT		4  /* object is in old generation */
-#define SURVIVALBIT	5  /* young object survived one GC cycle */
 #define TOUCHEDBIT	6  /* old object was touched by write barrier */
-/* bit 7 is currently used by tests (luaL_checkmemory) */
+#define TESTBIT		7  /* reserved for tests (ltests TESTGRAYBIT) */
+/* bit 5 was SURVIVALBIT in an earlier draft; unused — left free */
 
 #define isold(x)	testbit((x)->marked, OLDBIT)
 

@@ -168,14 +168,7 @@ void luaC_barrier_ (lua_State *L, GCObject *o, GCObject *v) {
   global_State *g = G(L);
   lua_assert(isblack(o) && iswhite(v) && !isdead(g, v) && !isdead(g, o));
   if (keepinvariant(g)) {  /* must keep invariant? */
-    if (o->tt == LUA_TPROTO && isold(o)) {
-      black2gray(o);
-      l_setbit(o->marked, TOUCHEDBIT);
-      *getgclist(o) = g->grayagain;
-      g->grayagain = o;
-    }
-    else
-      reallymarkobject(g, v);  /* restore invariant */
+    reallymarkobject(g, v);  /* restore invariant */
   }
   else if (g->inbleach)  /* incrementally bleaching oldgen before restartcollection? */
     return;
@@ -370,8 +363,8 @@ static void markoldweak (global_State *g) {
       g->oldcount--;
     if (o->tt == LUA_TTABLE)
       gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
-    resetbits(o->marked, bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                         bitmask(TOUCHEDBIT) | bitmask(7));
+    resetbits(o->marked, bitmask(OLDBIT) |
+                         bitmask(TOUCHEDBIT) | bitmask(TESTBIT));
     if (iswhite(o))
       reallymarkobject(g, o);
     o = next;
@@ -469,13 +462,13 @@ static void startbleach (global_State *g) {
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
   }
   g->fintail = p;
   makewhite(g, g->mainthread);
-  resetbits(g->mainthread->marked, bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                                   bitmask(TOUCHEDBIT) | bitmask(7));
+  resetbits(g->mainthread->marked, bitmask(OLDBIT) |
+                                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT));
   g->oldcount = 0;
   g->needmajor = 0;
   g->ismajor = 1;
@@ -496,8 +489,8 @@ static lu_mem bleachstep (global_State *g) {
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
     curr->next = g->allgc;
     g->allgc = curr;
     count--;
@@ -510,8 +503,8 @@ static lu_mem bleachstep (global_State *g) {
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
     curr->next = NULL;
     *g->fintail = curr;
     g->fintail = &curr->next;
@@ -545,16 +538,16 @@ static void mergeoldgen (global_State *g) {
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
   }
   for (p = &g->oldgc; *p != NULL; p = &(*p)->next) {
     GCObject *curr = *p;
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
   }
   *p = g->allgc;
   g->allgc = g->oldgc;
@@ -564,24 +557,24 @@ static void mergeoldgen (global_State *g) {
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
   }
   for (p = &g->oldfinobj; *p != NULL; p = &(*p)->next) {
     GCObject *curr = *p;
     if (curr->tt == LUA_TTABLE)
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                   bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                   bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                   bitmask(OLDBIT) |
+                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
   }
   if (g->oldfinobj != NULL) {
     *findlast(&g->finobj) = g->oldfinobj;
     g->oldfinobj = NULL;
   }
   makewhite(g, g->mainthread);
-  resetbits(g->mainthread->marked, bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                                   bitmask(TOUCHEDBIT) | bitmask(7));
+  resetbits(g->mainthread->marked, bitmask(OLDBIT) |
+                                   bitmask(TOUCHEDBIT) | bitmask(TESTBIT));
   g->oldcount = 0;
   g->needmajor = 0;
 }
@@ -648,7 +641,7 @@ static void traverseweakvalue (global_State *g, Table *h) {
   else if (isold(h)) {
     gray2black(h);
     h->flags &= cast_byte(~TM_WEAKBIT);
-    resetbits(h->marked, bitmask(SURVIVALBIT) | bitmask(7));
+    resetbits(h->marked, bitmask(TESTBIT));
   }
 }
 
@@ -701,7 +694,7 @@ static int traverseephemeron (global_State *g, Table *h) {
   else if (isold(h)) {
     gray2black(h);
     h->flags &= cast_byte(~TM_WEAKBIT);
-    resetbits(h->marked, bitmask(SURVIVALBIT) | bitmask(7));
+    resetbits(h->marked, bitmask(TESTBIT));
   }
   return marked;
 }
@@ -762,7 +755,7 @@ static lu_mem traversetable (global_State *g, Table *h) {
 */
 static int traverseproto (global_State *g, Proto *f) {
   int i;
-  if (f->cache && (iswhite(f->cache) || isold(f)))
+  if (f->cache && iswhite(f->cache))
     f->cache = NULL;  /* allow cache to be collected */
   markobjectN(g, f->source);
   for (i = 0; i < f->sizek; i++)  /* mark literals */
@@ -844,7 +837,7 @@ static void propagatemark (global_State *g) {
   lu_mem size;
   GCObject *o = g->gray;
   lua_assert(isgray(o));
-  resetbits(o->marked, bitmask(TOUCHEDBIT) | bitmask(7));
+  resetbits(o->marked, bitmask(TOUCHEDBIT) | bitmask(TESTBIT));
   gray2black(o);
   switch (o->tt) {
     case LUA_TTABLE: {
@@ -1040,8 +1033,8 @@ static GCObject **sweeplist (lua_State *L, GCObject **p, lu_mem count) {
       if (curr->tt == LUA_TTABLE)
         gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
       curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                     bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                     bitmask(OLDBIT) |
+                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
       p = &curr->next;  /* go to next element */
     }
   }
@@ -1075,15 +1068,15 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
       if (curr->tt == LUA_TTABLE)
         gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
       curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                     bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                     bitmask(OLDBIT) |
+                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
       curr->next = g->allgc;
       g->allgc = curr;
     }
     else if (curr->tt == LUA_TTHREAD) {
       curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                     bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                     bitmask(OLDBIT) |
+                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
       curr->next = g->allgc;
       g->allgc = curr;
       linkgclist(gco2th(curr), g->oldweak);
@@ -1092,8 +1085,8 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
     else if (curr->tt == LUA_TTABLE && (gco2t(curr)->flags & TM_WEAKBIT)) {
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
       curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                     bitmask(OLDBIT) | bitmask(SURVIVALBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(7))) | white);
+                     bitmask(OLDBIT) |
+                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
       curr->next = g->allgc;
       g->allgc = curr;
       linkgclist(gco2t(curr), g->oldweak);
@@ -1108,17 +1101,17 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
       }
       if (testbit(marked, TOUCHEDBIT) && curr->tt != LUA_TUSERDATA) {
         curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(BLACKBIT) |
-                       bitmask(SURVIVALBIT) | bitmask(7))) |
+                       bitmask(TESTBIT))) |
                        bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
       }
       else if (testbit(marked, TOUCHEDBIT)) {
         curr->marked = cast_byte((marked & ~(WHITEBITS |
-                       bitmask(SURVIVALBIT) | bitmask(7))) |
+                       bitmask(TESTBIT))) |
                        bitmask(BLACKBIT) | bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
       }
       else {
-        curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(SURVIVALBIT) |
-                       bitmask(TOUCHEDBIT) | bitmask(7))) |
+        curr->marked = cast_byte((marked & ~(WHITEBITS |
+                       bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) |
                        bitmask(BLACKBIT) | bitmask(OLDBIT));
       }
       curr->next = g->oldgc;
@@ -1145,17 +1138,17 @@ static GCObject **sweepfinobj (global_State *g, GCObject **p, lu_mem count) {
     }
     if (testbit(marked, TOUCHEDBIT) && curr->tt != LUA_TUSERDATA) {
       curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(BLACKBIT) |
-                     bitmask(SURVIVALBIT) | bitmask(7))) |
+                     bitmask(TESTBIT))) |
                      bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
     }
     else if (testbit(marked, TOUCHEDBIT)) {
       curr->marked = cast_byte((marked & ~(WHITEBITS |
-                     bitmask(SURVIVALBIT) | bitmask(7))) |
+                     bitmask(TESTBIT))) |
                      bitmask(BLACKBIT) | bitmask(OLDBIT) | bitmask(TOUCHEDBIT));
     }
     else {
-      curr->marked = cast_byte((marked & ~(WHITEBITS | bitmask(SURVIVALBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(7))) |
+      curr->marked = cast_byte((marked & ~(WHITEBITS |
+                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) |
                      bitmask(BLACKBIT) | bitmask(OLDBIT));
     }
     g->oldcount++;
@@ -1209,7 +1202,7 @@ static GCObject *udata2finalize (global_State *g) {
   if (o->tt == LUA_TTABLE)
     gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
   resetbits(o->marked, bitmask(FINALIZEDBIT) | bitmask(OLDBIT) |
-                       bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) | bitmask(7));
+                       bitmask(TOUCHEDBIT) | bitmask(TESTBIT));
   if (issweepphase(g))
     makewhite(g, o);  /* "sweep" object */
   return o;
@@ -1343,8 +1336,8 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
             gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
           if (g->inbleach) {
             o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                        bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                        bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+                        bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                        bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
             if (g->finobj == NULL)
               g->fintail = &o->next;
             o->next = g->finobj;
@@ -1352,15 +1345,15 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
           }
           else if (g->tobesweptfin != NULL) {
             o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                        bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                        bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+                        bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                        bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
             o->next = g->finobj;
             g->finobj = o;
             g->needmajor = 1;
           }
           else {
-            o->marked = cast_byte((o->marked & ~(WHITEBITS | bitmask(SURVIVALBIT) |
-                        bitmask(TOUCHEDBIT) | bitmask(7))) |
+            o->marked = cast_byte((o->marked & ~(WHITEBITS |
+                        bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) |
                         bitmask(BLACKBIT) | bitmask(OLDBIT) | bitmask(FINALIZEDBIT));
             o->next = g->oldfinobj;
             g->oldfinobj = o;
@@ -1405,8 +1398,8 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
         if (o->tt == LUA_TTABLE)
           gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
         o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                    bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                    bitmask(7))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+                    bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                    bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
         o->next = g->finobj;
         g->finobj = o;
         g->needmajor = 1;
@@ -1482,8 +1475,8 @@ static void entersweep (lua_State *L) {
     if (o->tt == LUA_TTABLE)
       gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
     o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                bitmask(OLDBIT) | bitmask(SURVIVALBIT) | bitmask(TOUCHEDBIT) |
-                bitmask(7))) | white);
+                bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                bitmask(TESTBIT))) | white);
   }
   if (!g->infullgc && g->gcrunning) {
     g->tobeswept = g->allgc;
@@ -1576,11 +1569,11 @@ static l_mem atomic (lua_State *L) {
   {
     GCObject *w;
     for (w = g->weak; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(SURVIVALBIT) | bitmask(7)); }
+      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(TESTBIT)); }
     for (w = g->ephemeron; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(SURVIVALBIT) | bitmask(7)); }
+      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(TESTBIT)); }
     for (w = g->allweak; w != NULL; w = gco2t(w)->gclist)
-      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(SURVIVALBIT) | bitmask(7)); }
+      if (isold(w)) { gray2black(w); gco2t(w)->flags &= cast_byte(~TM_WEAKBIT); resetbits(w->marked, bitmask(TESTBIT)); }
   }
   luaS_clearcache(g);
   g->currentwhite = cast_byte(otherwhite(g));  /* flip current white */

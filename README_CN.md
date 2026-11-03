@@ -4,7 +4,7 @@
 
 [English Documentation (README.md)](./README.md)
 
-**`lua53plus`** 是基于官方 **PUC-Lua 5.3.4** 深度优化的高性能纯单线程 C 增强版本，保持 **100% C API / ABI 与字节码无缝兼容**。
+**`lua53plus`** 是基于官方 **PUC-Lua 5.3.4** 深度优化的高性能纯单线程 C 增强版本，保持 **100% 公开 C API 与 5.3.4 字节码** 可替换（内部 GC 布局有扩展，见下方兼容性说明）。
 
 本项目专为在 C/C++ 服务端进程中内嵌 Lua 5.3 VM、且存在**大体量常驻内存**（数百 MB 的长生命周期配置表、脚本函数原型、闭包与常驻状态）并持续处理高频请求（不断分配短生命周期临时表、密集执行短字符串 key 表查找）的生产场景设计。
 
@@ -255,19 +255,44 @@ make clean
 
 ### 在现有 C/C++ 项目中直接替换
 
-`lua53plus` 与标准 PUC-Lua 5.3.4 保持 **100% 头文件、C ABI、编译参数及二进制字节码兼容**：
+### 兼容性：公开 API vs 内部布局
+
+**对外稳定（相对 PUC-Lua 5.3.4 可替换）：**
+
+- 公开头文件：`lua.h`、`lauxlib.h`、`lualib.h`、`luaconf.h`（及 `lua.hpp`）
+- 宿主程序使用的公开 C API 与调用约定
+- 独立 `lua` / `luac` 对脚本的行为
+- 面向 5.3.4 的预编译字节码格式与操作码语义
+
+**内部不稳定（勿在 `src/` 外依赖）：**
+
+- `global_State` / `GCObject` 等布局扩展（`oldgc`、`tobeswept`、`remudata` 等）
+- 额外的 `marked` 位（`OLDBIT`、`TOUCHEDBIT`、`TESTBIT`）与分代 GC 链表
+- 私有头文件（`lstate.h`、`lgc.h`、`lobject.h` 等）及结构体字段偏移
+
+嵌入建议：只链接 `liblua.a`（或编译 `src/*.c`）并只包含公开头文件；不要在宿主侧按内部 GC 结构体内存布局做假设。
 
 1. 将项目中原有的 `lua-5.3.4/src` 源码目录（或编译出的 `liblua.a`）替换为 `lua53plus/src`。
 2. 重新编译即可 —— 无需修改任何 C/C++ 宿主代码、链接参数或 Lua 脚本。
 
-### 运行随机交叉分代测试与基准测试
+### 运行测试与基准
 
 ```bash
-# 运行新老年代随机交叉引用与写屏障 Fuzz 测试套件
+# 语言 / 标准库 e2e（也可用 make test-e2e）
 ./src/lua tests/e2e/run_all.lua
+
+# 可选：为 GC fuzz 编译裸 userdata 辅助库
+make test-udata
+
+# 新老年代随机交叉引用与写屏障 Fuzz
 ./src/lua tests/test_gc_fuzz.lua
 
-# 运行基准测试
+# 官方 PUC-Lua 5.3.4 testes（详见 scripts/TESTES.md）
+./scripts/fetch_testes.sh
+make test-testes-basic
+./scripts/build_with_ltests.sh linux && make test-testes
+
+# 基准测试
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_gc_manualstep.lua
 ./src/lua bench/bench_table_lookup.lua

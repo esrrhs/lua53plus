@@ -4,7 +4,7 @@
 
 [中文文档 (README_CN.md)](./README_CN.md)
 
-**`lua53plus`** is a high-performance, 100% C API / ABI drop-in compatible enhancement of **PUC-Lua 5.3.4** written in pure single-threaded C.
+**`lua53plus`** is a high-performance enhancement of **PUC-Lua 5.3.4** written in pure single-threaded C, keeping a **100% public C API and 5.3.4 bytecode** drop-in surface (internal GC layouts differ — see Compatibility below).
 
 It is engineered for long-running C/C++ services and game/application servers that embed Lua 5.3 with a **large resident heap** (hundreds of megabytes of long-lived configuration tables, function prototypes, closures, and persistent state) while continuously processing high-frequency requests that allocate short-lived objects and perform intensive string-keyed table lookups.
 
@@ -235,7 +235,22 @@ This produces:
 
 ### Drop-In Replacement in C/C++ Projects
 
-`lua53plus` preserves 100% of the public headers (`lua.h`, `lauxlib.h`, `lualib.h`, `luaconf.h`), C ABI, build flags, and precompiled bytecode format of PUC-Lua 5.3.4:
+### Compatibility: public API vs internal layout
+
+**Public / drop-in (stable vs PUC-Lua 5.3.4):**
+
+- Public headers: `lua.h`, `lauxlib.h`, `lualib.h`, `luaconf.h` (and `lua.hpp`)
+- Public C API & calling convention used by host applications
+- Standalone `lua` / `luac` CLI behavior for scripts
+- Precompiled bytecode format and opcode semantics intended for 5.3.4
+
+**Internal (not a stable ABI — do not depend on these from outside `src/`):**
+
+- `global_State` / `GCObject` layout extensions (`oldgc`, `tobeswept`, `remudata`, …)
+- Extra `marked` bits (`OLDBIT`, `TOUCHEDBIT`, `TESTBIT`) and generational GC lists
+- Private headers (`lstate.h`, `lgc.h`, `lobject.h`, …) and struct field offsets
+
+Embedding guidance: link `liblua.a` (or compile `src/*.c`) and include only the public headers. Do not memcpy or reinterpret internal GC structs from host code.
 
 1. Replace your project's `lua-5.3.4/src` directory (or `liblua.a`) with `lua53plus/src`.
 2. Recompile — no changes to your C/C++ host code, linker flags, or Lua scripts are required.
@@ -246,8 +261,17 @@ This produces:
 # Language / stdlib end-to-end suite (excludes GC; also: make test-e2e)
 ./src/lua tests/e2e/run_all.lua
 
+# Optional: build bare-userdata helper used by the GC fuzz suite
+make test-udata
+
 # Run randomized cross-generation GC & write-barrier fuzz test suite
 ./src/lua tests/test_gc_fuzz.lua
+
+# Official PUC-Lua 5.3.4 testes (see scripts/TESTES.md)
+./scripts/fetch_testes.sh
+make test-testes-basic
+# complete suite with internal T module:
+./scripts/build_with_ltests.sh linux && make test-testes
 
 # Run benchmarks
 ./src/lua bench/bench_gc_largeheap.lua
