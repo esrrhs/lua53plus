@@ -9,7 +9,20 @@ SHA256="b80771238271c72565e5a1183292ef31bd7166414cd0d43a8eb79845fa7f599f"
 TGZ="${TMPDIR:-/tmp}/lua-5.3.4-tests.tar.gz"
 
 echo "Downloading $URL ..."
-curl -fsSL -o "$TGZ" "$URL"
+# lua.org is occasionally unreachable from CI runners; retry with backoff.
+ok=0
+for attempt in 1 2 3 4 5; do
+  if curl -fsSL --connect-timeout 30 --max-time 180 -o "$TGZ" "$URL"; then
+    ok=1
+    break
+  fi
+  echo "curl failed (attempt $attempt); retrying in $((attempt * 5))s ..." >&2
+  sleep $((attempt * 5))
+done
+if [ "$ok" -ne 1 ]; then
+  echo "failed to download $URL after retries" >&2
+  exit 1
+fi
 echo "$SHA256  $TGZ" | sha256sum -c -
 
 rm -rf testes

@@ -68,7 +68,7 @@
 #if defined(LUA_USE_MACOSX)
 #define LUA_USE_POSIX
 #define LUA_USE_DLOPEN		/* MacOS does not need -ldl */
-#define LUA_USE_READLINE	/* needs an extra library: -lreadline */
+/* LUA_USE_READLINE is set by the Makefile macosx target together with -lreadline */
 #endif
 
 

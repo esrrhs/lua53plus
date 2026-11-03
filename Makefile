@@ -62,9 +62,16 @@ test-e2e:	dummy
 	src/lua tests/e2e/run_all.lua
 
 # Optional bare-userdata helper for GC fuzz (ignored by git as *.so)
+# macOS needs -undefined dynamic_lookup so Lua API symbols resolve at load time
+# (Linux shared objects allow unresolved refs by default).
 TEST_UDATA_CFLAGS ?= -std=gnu99 -O2 -fPIC -Isrc
+TEST_UDATA_LDFLAGS ?= -shared
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+TEST_UDATA_LDFLAGS += -undefined dynamic_lookup
+endif
 tests/t_udata.so: tests/t_udata.c src/lua.h src/lauxlib.h
-	gcc $(TEST_UDATA_CFLAGS) -shared -o $@ tests/t_udata.c
+	gcc $(TEST_UDATA_CFLAGS) $(TEST_UDATA_LDFLAGS) -o $@ tests/t_udata.c
 
 test-udata: tests/t_udata.so
 
