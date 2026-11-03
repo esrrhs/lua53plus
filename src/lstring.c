@@ -243,6 +243,7 @@ Udata *luaS_newudata (lua_State *L, size_t s) {
   u->len = s;
   u->metatable = NULL;
   u->gclist = NULL;
+  u->listprev = NULL;
   setuservalue(L, u, luaO_nilobject);
   return u;
 }

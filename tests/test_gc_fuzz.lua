@@ -11,7 +11,9 @@
 local debug = require("debug")
 local T = rawget(_G, "T")
 
--- Optional bare-userdata helper (tests/t_udata.so) for remudata/tobeswept coverage
+-- Bare-userdata helper (tests/t_udata.so) for remudata/tobeswept coverage.
+-- CI sets FUZZ_REQUIRE_UDATA=1 so a missing .so fails loudly instead of
+-- silently skipping userdata paths.
 local UdataHelper = nil
 do
   local dir = (debug.getinfo(1, "S").source:match("^@(.*)/") or ".")
@@ -19,6 +21,8 @@ do
   local opener = package.loadlib(so, "luaopen_t_udata")
   if type(opener) == "function" then
     UdataHelper = opener()
+  elseif os.getenv("FUZZ_REQUIRE_UDATA") == "1" then
+    error("FUZZ_REQUIRE_UDATA=1 but cannot load " .. so .. " (run: make test-udata)")
   end
 end
 
@@ -834,15 +838,86 @@ local function test_atomic_debt_and_large_heap_pause()
   io.write("OK\n")
 end
 
+-- Regression Test 5: undump + closed upvaluejoin + weak-key ephemeron under oldgc __gc attach
+local function test_undump_upvalue_weak_oldgc_finalizer()
+  io.write("  [regression: undump/upvaluejoin/weak + oldgc checkfinalizer] ")
+  io.flush()
+  collectgarbage("stop")
+
+  -- Build a dumped chunk whose prototype caches a closure; reload and mutate upvalues
+  local src = [[
+    local a, b = ...
+    return function(x)
+      if x == "get" then return a, b end
+      a = x
+      return a
+    end
+  ]]
+  local dumped = string.dump(assert(load(src, "undump_uv")))
+  local factory = assert(load(dumped, "undump_uv_bin", "b"))
+  local old_holder = {}
+  for i = 1, 200 do
+    old_holder[i] = factory({ i }, { i * 2 })
+  end
+  while not collectgarbage("step", 100) do end  -- promote
+
+  local eph = setmetatable({}, { __mode = "k" })
+  local live_keys = {}
+  for i = 1, 50 do
+    local k = { i = i }
+    live_keys[i] = k
+    eph[k] = old_holder[i]
+  end
+
+  -- upvaluejoin across two promoted closures
+  local c1, c2 = old_holder[1], old_holder[2]
+  debug.upvaluejoin(c1, 1, c2, 1)
+  c2("joined")
+  local a1 = c1("get")
+  assert(a1 == "joined" or (type(a1) == "table"), "upvaluejoin after undump/promote failed")
+
+  -- Attach __gc to many old tables (exercises O(1) oldgc unlink via listprev)
+  local fin_count = 0
+  local gc_mt = { __gc = function() fin_count = fin_count + 1 end }
+  for i = 100, 200 do
+    if type(old_holder[i]) == "function" then
+      -- create old table and give it __gc after promotion
+      local t = { id = i, f = old_holder[i] }
+      old_holder[i] = t
+    end
+  end
+  while not collectgarbage("step", 50) do end
+  for i = 100, 200 do
+    if type(old_holder[i]) == "table" and not getmetatable(old_holder[i]) then
+      setmetatable(old_holder[i], gc_mt)
+    end
+  end
+
+  live_keys = nil
+  old_holder = nil
+  eph = nil
+  collectgarbage("collect")
+  assert(fin_count > 0, "expected some oldgc finalizers to run")
+  collectgarbage("restart")
+  io.write("OK\n")
+end
+
 print("=== Running Randomized Cross-Generation GC Fuzz Suite ===")
 test_atomic_debt_and_large_heap_pause()
 test_heavy_upval_and_grayagain_drain()
 test_finalizer_order_across_generations()
 test_inbleach_cross_reference_mutations()
 test_gc_adversarial_edge_cases()
+test_undump_upvalue_weak_oldgc_finalizer()
 
-local NUM_OPS = tonumber(os.getenv("FUZZ_OPS")) or 4000
-local seeds = { 101, 2026, 31415, 65537, 999983, 133742, 7777777, 42424242 }
+local NUM_OPS = tonumber(os.getenv("FUZZ_OPS")) or 5000
+local extra = os.getenv("FUZZ_EXTRA_SEEDS")
+local seeds = { 101, 2026, 31415, 65537, 999983, 133742, 7777777, 42424242, 0xC0FFEE, 8675309 }
+if extra and #extra > 0 then
+  for s in string.gmatch(extra, "[^,]+") do
+    seeds[#seeds + 1] = tonumber(s) or 1
+  end
+end
 for idx, s in ipairs(seeds) do
   local manual = (idx % 2 == 1)
   run_fuzz_round(s, manual, NUM_OPS)

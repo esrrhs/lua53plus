@@ -409,6 +409,7 @@ Table *luaH_new (lua_State *L) {
   t->flags = cast_byte(~(TM_HASMODE | TM_WEAKBIT));
   t->array = NULL;
   t->sizearray = 0;
+  t->listprev = NULL;
   setnodevector(L, t, 0);
   return t;
 }

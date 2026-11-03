@@ -36,6 +36,9 @@ jobs:
           ./src/lua tests/e2e/run_all.lua
 
       - name: Run randomized cross-generation GC fuzz suite (with lua_assert)
+        env:
+          FUZZ_OPS: "5000"
+          FUZZ_REQUIRE_UDATA: "1"
         run: |
           ./src/lua tests/test_gc_fuzz.lua
 
@@ -69,6 +72,9 @@ jobs:
           ./src/lua tests/e2e/run_all.lua
 
       - name: Run randomized cross-generation GC fuzz suite (release build)
+        env:
+          FUZZ_OPS: "5000"
+          FUZZ_REQUIRE_UDATA: "1"
         run: |
           ./src/lua tests/test_gc_fuzz.lua
 
@@ -95,3 +101,47 @@ jobs:
           ./src/lua bench/bench_gc_manualstep.lua
           ./src/lua bench/bench_table_lookup.lua
           ./src/lua bench/bench_mixed_workload.lua
+
+  # AddressSanitizer + UndefinedBehaviorSanitizer (Ubuntu): catches heap
+  # corruption / UB in GC fuzz and language e2e. Keeps existing jobs.
+  asan-ubsan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build lua53plus with ASan+UBSan
+        run: |
+          make linux MYCFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert' \
+                     MYLDFLAGS='-fsanitize=address,undefined'
+
+      - name: Build tests/t_udata.so with matching sanitizers
+        run: |
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O1 -g -fPIC -Isrc -fsanitize=address,undefined -fno-omit-frame-pointer'
+          # Shared object must also link sanitizer runtime when loaded into ASan binary
+          gcc -std=gnu99 -O1 -g -fPIC -Isrc -fsanitize=address,undefined -fno-omit-frame-pointer \
+              -shared -o tests/t_udata.so tests/t_udata.c
+
+      - name: Run language/stdlib e2e suite (ASan)
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ./src/lua tests/e2e/run_all.lua
+
+      - name: Run GC fuzz suite (ASan, extra ops/seeds)
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+          FUZZ_OPS: "6000"
+          FUZZ_REQUIRE_UDATA: "1"
+        run: |
+          ./src/lua tests/test_gc_fuzz.lua
+
+      - name: Fetch official testes and run basic suite (ASan)
+        env:
+          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          ./scripts/fetch_testes.sh
+          make test-testes-basic

@@ -126,6 +126,90 @@ static GCObject **getgclist (GCObject *o) {
 
 
 /*
+** Reverse links for Table/Udata on 'oldgc'. Only those types can receive
+** __gc via lua_setmetatable, so checkfinalizer's oldgc unlink is O(1)
+** instead of scanning a potentially huge old generation. Other types on
+** oldgc leave listprev unused; setlistprev is a no-op for them.
+*/
+#define haslistprev(o)	((o)->tt == LUA_TTABLE || (o)->tt == LUA_TUSERDATA)
+
+static void setlistprev (GCObject *o, GCObject *prev) {
+  if (o->tt == LUA_TTABLE)
+    gco2t(o)->listprev = prev;
+  else if (o->tt == LUA_TUSERDATA)
+    gco2u(o)->listprev = prev;
+}
+
+
+static GCObject *getlistprev (GCObject *o) {
+  if (o->tt == LUA_TTABLE)
+    return gco2t(o)->listprev;
+  if (o->tt == LUA_TUSERDATA)
+    return gco2u(o)->listprev;
+  return NULL;
+}
+
+
+static void linkoldgc (global_State *g, GCObject *curr) {
+  if (g->oldgc != NULL)
+    setlistprev(g->oldgc, curr);
+  setlistprev(curr, NULL);
+  curr->next = g->oldgc;
+  g->oldgc = curr;
+}
+
+
+static GCObject *popoldgc (global_State *g) {
+  GCObject *curr = g->oldgc;
+  lua_assert(curr != NULL);
+  g->oldgc = curr->next;
+  if (g->oldgc != NULL)
+    setlistprev(g->oldgc, NULL);
+  setlistprev(curr, NULL);
+  return curr;
+}
+
+
+/*
+** Unlink 'o' from oldgc. Table/Udata use listprev for O(1); on mismatch
+** (should not happen) fall back to a linear scan and repair listprev.
+*/
+static int unlinkoldgc (global_State *g, GCObject *o) {
+  GCObject **p;
+  GCObject *prev = NULL;
+  if (haslistprev(o)) {
+    prev = getlistprev(o);
+    if (prev == NULL) {
+      if (g->oldgc == o) {
+        g->oldgc = o->next;
+        if (o->next != NULL)
+          setlistprev(o->next, NULL);
+        setlistprev(o, NULL);
+        return 1;
+      }
+    }
+    else if (prev->next == o) {
+      prev->next = o->next;
+      if (o->next != NULL)
+        setlistprev(o->next, prev);
+      setlistprev(o, NULL);
+      return 1;
+    }
+  }
+  /* linear fallback (non-TU or inconsistent listprev) */
+  prev = NULL;
+  for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next)
+    prev = *p;
+  if (*p != o) return 0;
+  *p = o->next;
+  if (o->next != NULL)
+    setlistprev(o->next, prev);
+  setlistprev(o, NULL);
+  return 1;
+}
+
+
+/*
 ** If key is not marked, mark its entry as dead. This allows key to be
 ** collected, but keeps its entry in the table.  A dead node is needed
 ** when Lua looks up for a key (it may be part of a chain) and when
@@ -482,8 +566,7 @@ static lu_mem bleachstep (global_State *g) {
   int white = luaC_white(g);
   lu_mem count = GCSWEEPMAX;
   while (g->oldgc != NULL && count > 0) {
-    GCObject *curr = g->oldgc;
-    g->oldgc = curr->next;
+    GCObject *curr = popoldgc(g);
     if (g->oldgc != NULL)
       l_prefetch(g->oldgc);
     if (curr->tt == LUA_TTABLE)
@@ -548,6 +631,7 @@ static void mergeoldgen (global_State *g) {
     curr->marked = cast_byte((curr->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                    bitmask(OLDBIT) |
                    bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
+    setlistprev(curr, NULL);
   }
   *p = g->allgc;
   g->allgc = g->oldgc;
@@ -1114,8 +1198,7 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
                        bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) |
                        bitmask(BLACKBIT) | bitmask(OLDBIT));
       }
-      curr->next = g->oldgc;
-      g->oldgc = curr;
+      linkoldgc(g, curr);
       g->oldcount++;
     }
   }
@@ -1308,9 +1391,8 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
   else {  /* move 'o' to 'finobj' list */
     GCObject **p;
     if (isold(o)) {
-      for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
-      if (*p == o) {
-        *p = o->next;
+      /* O(1) for Table/Udata via listprev; linear fallback otherwise */
+      if (unlinkoldgc(g, o)) {
         if (g->oldcount > 0)
           g->oldcount--;
         if (keepinvariant(g)) {

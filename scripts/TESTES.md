@@ -34,9 +34,10 @@ CI uses `_port=true` so non-portable checks (notably `files.lua` invalid
 
 1. **`markgrays`**: also walks `g->grayatomic` and `g->oldweak`.
 2. **CI `_port=true`**: skip non-portable I/O assumptions.
-3. Generational lists `oldgc` / `tobeswept` / `remudata` are **not** fully
-   mirrored inside stock `lua_checkmemory`; coverage for those paths is in
-   `tests/test_gc_fuzz.lua` and e2e.
+3. **`lua_checkmemory`**: walks `oldgc` / `oldfinobj` / `tobeswept` /
+   `tobesweptfin` / `remudata`; `checkobject` allows non-white `isold`
+   objects at `GCSpause`; `testobjref1` allows old-black → young-white
+   (TOUCHEDBIT / `oldweak` rescans). Fuzz/e2e still stress barriers.
 
 ## Optional: git submodule alternative
 

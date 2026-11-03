@@ -348,6 +348,7 @@ typedef struct Udata {
   lu_byte ttuv_;  /* user value's tag */
   struct Table *metatable;
   GCObject *gclist;  /* link in 'g->remudata' when old and touched */
+  GCObject *listprev;  /* prev in oldgc for O(1) checkfinalizer unlink */
   size_t len;  /* number of bytes */
   union Value user_;  /* user value */
 } Udata;
@@ -505,6 +506,7 @@ typedef struct Table {
   Node *lastfree;  /* any free position is before this position */
   struct Table *metatable;
   GCObject *gclist;
+  GCObject *listprev;  /* prev in oldgc for O(1) checkfinalizer unlink */
 } Table;
 
 

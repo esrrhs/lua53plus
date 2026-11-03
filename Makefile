@@ -62,8 +62,9 @@ test-e2e:	dummy
 	src/lua tests/e2e/run_all.lua
 
 # Optional bare-userdata helper for GC fuzz (ignored by git as *.so)
+TEST_UDATA_CFLAGS ?= -std=gnu99 -O2 -fPIC -Isrc
 tests/t_udata.so: tests/t_udata.c src/lua.h src/lauxlib.h
-	gcc -std=gnu99 -O2 -fPIC -Isrc -shared -o $@ tests/t_udata.c
+	gcc $(TEST_UDATA_CFLAGS) -shared -o $@ tests/t_udata.c
 
 test-udata: tests/t_udata.so
 
