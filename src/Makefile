@@ -103,8 +103,12 @@ c89:
 
 # Same probe gates both -DLUA_USE_READLINE (luaconf) and -lreadline.
 # Shared by linux / macosx / freebsd so missing readline never breaks the build.
-READLINE_CFLAGS= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-DLUA_USE_READLINE")
-READLINE_LIB= $(shell printf '#include <readline/readline.h>\nint main(void){return 0;}\n' | $(CC) -xc - -lreadline -o /dev/null 2>/dev/null && echo "-lreadline")
+# Do not put '#' inside $(shell ...): macOS make (GNU 3.81) treats it as a
+# comment even there, truncating the line ("unterminated call to function shell").
+# Use compiler -include instead of a '#include' in the printf'd snippet.
+READLINE_PROBE= $(shell printf 'int main(void){return 0;}\n' | $(CC) -xc - -include readline/readline.h -lreadline -o /dev/null 2>/dev/null && echo yes)
+READLINE_CFLAGS= $(if $(READLINE_PROBE),-DLUA_USE_READLINE,)
+READLINE_LIB= $(if $(READLINE_PROBE),-lreadline,)
 
 freebsd:
 	$(MAKE) $(ALL) SYSCFLAGS="-DLUA_USE_LINUX $(READLINE_CFLAGS)" SYSLIBS="-Wl,-E $(READLINE_LIB)"
