@@ -292,12 +292,17 @@ make test-udata
 make test-testes-basic
 ./scripts/build_with_ltests.sh linux && make test-testes
 
+# ASan+UBSan（Linux 上含 LSan）：e2e、强制 udata 的 GC fuzz、官方 testes
+# ./scripts/run_sanitizer_tests.sh linux    # 或 macosx
+
 # 基准测试
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_gc_manualstep.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua
 ```
+
+平台矩阵、sanitizer 选项，以及本机实际跑过 vs 仅待 CI：[`scripts/TESTING_CN.md`](scripts/TESTING_CN.md)。
 
 ---
 

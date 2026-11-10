@@ -76,6 +76,13 @@ tests/t_udata.so: tests/t_udata.c src/lua.h src/lauxlib.h
 test-udata: tests/t_udata.so
 
 # Official PUC-Lua 5.3.4 testes (fetch first: scripts/fetch_testes.sh)
+# C modules: override TESTES_LIBS_CFLAGS for -m32 or -fsanitize=...
+# Darwin needs -undefined dynamic_lookup so Lua API symbols resolve at load.
+TESTES_LIBS_CFLAGS ?= -Wall -std=gnu99 -O2 -I../../src -fPIC -shared
+ifeq ($(UNAME_S),Darwin)
+TESTES_LIBS_CFLAGS += -undefined dynamic_lookup
+endif
+
 test-testes-basic:	dummy
 	@test -f testes/all.lua || { echo "missing testes/; run scripts/fetch_testes.sh"; exit 1; }
 	cd testes && ../src/lua -e'_U=true' all.lua
@@ -83,7 +90,7 @@ test-testes-basic:	dummy
 test-testes:	dummy
 	@test -f testes/all.lua || { echo "missing testes/; run scripts/fetch_testes.sh"; exit 1; }
 	@test -f src/lua || { echo "build interpreter first (e.g. make linux)"; exit 1; }
-	cd testes/libs && $(MAKE) LUA_DIR=../../src
+	cd testes/libs && $(RM) lib1.so lib11.so lib2.so lib21.so lib2-v2.so && $(MAKE) LUA_DIR=../../src CFLAGS="$(TESTES_LIBS_CFLAGS)"
 	cd testes && ../src/lua -e'_port=true' all.lua
 
 install: dummy

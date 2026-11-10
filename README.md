@@ -273,12 +273,17 @@ make test-testes-basic
 # complete suite with internal T module:
 ./scripts/build_with_ltests.sh linux && make test-testes
 
+# ASan+UBSan (+ LSan on Linux): e2e, GC fuzz (udata required), official testes
+# ./scripts/run_sanitizer_tests.sh linux    # or macosx
+
 # Run benchmarks
 ./src/lua bench/bench_gc_largeheap.lua
 ./src/lua bench/bench_gc_manualstep.lua
 ./src/lua bench/bench_table_lookup.lua
 ./src/lua bench/bench_mixed_workload.lua
 ```
+
+Platform matrix, sanitizer options, and what has been run locally versus only in CI: [`scripts/TESTING.md`](scripts/TESTING.md).
 
 ---
 

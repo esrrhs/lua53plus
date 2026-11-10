@@ -8,28 +8,50 @@ on:
 
 jobs:
   build-and-test:
+    name: ${{ matrix.name }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - name: ubuntu-linux
+            os: ubuntu-latest
             target: linux
+            extra_cflags: ""
+            extra_ldflags: ""
             run_full_testes: true
-          - os: macos-latest
+            install_i386: false
+          - name: macos-macosx
+            os: macos-latest
             target: macosx
-            run_full_testes: false
+            extra_cflags: ""
+            extra_ldflags: ""
+            run_full_testes: true
+            install_i386: false
+          - name: ubuntu-linux32
+            os: ubuntu-latest
+            target: linux
+            extra_cflags: "-m32"
+            extra_ldflags: "-m32"
+            run_full_testes: true
+            install_i386: true
     runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install 32-bit toolchain
+        if: matrix.install_i386
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-multilib libc6-dev-i386
+
       - name: Build lua53plus (with internal lua_assert enabled)
         run: |
-          make ${{ matrix.target }} MYCFLAGS='-DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert'
+          make ${{ matrix.target }} MYCFLAGS='-DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert ${{ matrix.extra_cflags }}' MYLDFLAGS='${{ matrix.extra_ldflags }}'
 
       - name: Build tests/t_udata.so for GC fuzz userdata paths
         run: |
-          make test-udata
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}' TEST_UDATA_LDFLAGS='-shared ${{ matrix.extra_ldflags }}'
 
       - name: Run language/stdlib e2e suite (with lua_assert)
         run: |
@@ -52,20 +74,23 @@ jobs:
 
       - name: Rebuild with ltests + run complete official testes
         if: matrix.run_full_testes
+        env:
+          EXTRA_CFLAGS: ${{ matrix.extra_cflags }}
+          EXTRA_LDFLAGS: ${{ matrix.extra_ldflags }}
         run: |
           ./scripts/build_with_ltests.sh ${{ matrix.target }}
-          make test-testes
+          make test-testes TESTES_LIBS_CFLAGS='-Wall -std=gnu99 -O2 -I../../src -fPIC -shared ${{ matrix.extra_cflags }}'
 
       - name: Rebuild clean release binaries
         run: |
           make clean
-          make ${{ matrix.target }}
+          make ${{ matrix.target }} MYCFLAGS='${{ matrix.extra_cflags }}' MYLDFLAGS='${{ matrix.extra_ldflags }}'
           ./src/lua -v
           ./src/luac -v
 
       - name: Build tests/t_udata.so (release)
         run: |
-          make test-udata
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}' TEST_UDATA_LDFLAGS='-shared ${{ matrix.extra_ldflags }}'
 
       - name: Run language/stdlib e2e suite (release build)
         run: |
@@ -102,46 +127,35 @@ jobs:
           ./src/lua bench/bench_table_lookup.lua
           ./src/lua bench/bench_mixed_workload.lua
 
-  # AddressSanitizer + UndefinedBehaviorSanitizer (Ubuntu): catches heap
-  # corruption / UB in GC fuzz and language e2e. Keeps existing jobs.
+  # AddressSanitizer + UndefinedBehaviorSanitizer. Errors must fail the job
+  # (halt_on_error=1). LSan is on for Linux; it is not usable on macOS.
   asan-ubsan:
-    runs-on: ubuntu-latest
+    name: asan-${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: ubuntu
+            os: ubuntu-latest
+            target: linux
+            detect_leaks: "1"
+            run_full_testes: "1"
+          - name: macos
+            os: macos-latest
+            target: macosx
+            detect_leaks: "0"
+            run_full_testes: "1"
+    runs-on: ${{ matrix.os }}
+    env:
+      ASAN_OPTIONS: detect_leaks=${{ matrix.detect_leaks }}:halt_on_error=1:detect_stack_use_after_return=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      DETECT_LEAKS: ${{ matrix.detect_leaks }}
+      RUN_FULL_TESTES: ${{ matrix.run_full_testes }}
+      FUZZ_OPS: "6000"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build lua53plus with ASan+UBSan
+      - name: Build and run e2e, GC fuzz (udata required), and official testes under ASan+UBSan
         run: |
-          make linux MYCFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -DLUA_USE_APICHECK -include assert.h -Dlua_assert=assert' \
-                     MYLDFLAGS='-fsanitize=address,undefined'
-
-      - name: Build tests/t_udata.so with matching sanitizers
-        run: |
-          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O1 -g -fPIC -Isrc -fsanitize=address,undefined -fno-omit-frame-pointer'
-          # Shared object must also link sanitizer runtime when loaded into ASan binary
-          gcc -std=gnu99 -O1 -g -fPIC -Isrc -fsanitize=address,undefined -fno-omit-frame-pointer \
-              -shared -o tests/t_udata.so tests/t_udata.c
-
-      - name: Run language/stdlib e2e suite (ASan)
-        env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: |
-          ./src/lua tests/e2e/run_all.lua
-
-      - name: Run GC fuzz suite (ASan, extra ops/seeds)
-        env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-          FUZZ_OPS: "6000"
-          FUZZ_REQUIRE_UDATA: "1"
-        run: |
-          ./src/lua tests/test_gc_fuzz.lua
-
-      - name: Fetch official testes and run basic suite (ASan)
-        env:
-          ASAN_OPTIONS: detect_leaks=0:halt_on_error=1
-          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-        run: |
-          ./scripts/fetch_testes.sh
-          make test-testes-basic
+          ./scripts/run_sanitizer_tests.sh ${{ matrix.target }}
