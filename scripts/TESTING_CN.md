@@ -37,8 +37,9 @@ macOS ASan+UBSan。
 
 - Apple Clang 支持 `-fsanitize=address,undefined`。
 - Darwin 上 LSan 不可用，因此 `asan-macos` 使用 `detect_leaks=0`。
-- 完整官方 testes 需要给 `testes/libs/*.so` 加上 `-undefined dynamic_lookup`
- （`test-testes` 在 Darwin 上会自动追加）。
+- 完整官方 testes 需要给 `testes/libs/*.so` 加上 `-undefined dynamic_lookup`。
+  Makefile 使用 `override`，即便命令行设置了 `TEST_UDATA_LDFLAGS` 或
+  `TESTES_LIBS_CFLAGS` 也会保留该标志（否则会冲掉它，导致 `t_udata.so` 链接失败）。
 - `scripts/build_with_ltests.sh macosx` 用 `cc` 编译 `ltests`。
 
 ## 本地命令
@@ -62,8 +63,7 @@ make test-testes
 
 ```bash
 make linux MYCFLAGS=-m32 MYLDFLAGS=-m32
-make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc -m32' \
-                TEST_UDATA_LDFLAGS='-shared -m32'
+make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc -m32'
 ./src/lua tests/e2e/run_all.lua
 FUZZ_REQUIRE_UDATA=1 ./src/lua tests/test_gc_fuzz.lua
 ./scripts/fetch_testes.sh

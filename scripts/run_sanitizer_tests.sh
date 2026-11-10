@@ -68,7 +68,7 @@ make clean
 make "$PLAT" MYCFLAGS="$SAN_CFLAGS" MYLDFLAGS="$SAN_LDFLAGS"
 # shellcheck disable=SC2086
 rm -f tests/t_udata.so
-make test-udata TEST_UDATA_CFLAGS="$UDATA_CFLAGS" TEST_UDATA_LDFLAGS="-shared $SAN_LDFLAGS"
+make test-udata TEST_UDATA_CFLAGS="$UDATA_CFLAGS"
 ./src/lua -v
 
 echo "==== e2e (ASan+UBSan) ===="

@@ -43,7 +43,10 @@ machine; see below).
 - Apple Clang supports `-fsanitize=address,undefined`.
 - LeakSanitizer is not usable on Darwin, so `detect_leaks=0` on `asan-macos`.
 - Complete official testes need `testes/libs/*.so` linked with
-  `-undefined dynamic_lookup` (the `test-testes` target adds this on Darwin).
+  `-undefined dynamic_lookup`. The Makefile uses `override` so that flag
+  is kept even when `TEST_UDATA_LDFLAGS` or `TESTES_LIBS_CFLAGS` is set
+  on the command line (passing those variables without `override` would
+  drop it and fail to link `t_udata.so`).
 - `scripts/build_with_ltests.sh macosx` compiles `ltests` with `cc`.
 
 ## Local commands
@@ -67,8 +70,7 @@ Requires a 32-bit libc and `gcc -m32` (on Ubuntu: `gcc-multilib libc6-dev-i386`)
 
 ```bash
 make linux MYCFLAGS=-m32 MYLDFLAGS=-m32
-make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc -m32' \
-                TEST_UDATA_LDFLAGS='-shared -m32'
+make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc -m32'
 ./src/lua tests/e2e/run_all.lua
 FUZZ_REQUIRE_UDATA=1 ./src/lua tests/test_gc_fuzz.lua
 ./scripts/fetch_testes.sh

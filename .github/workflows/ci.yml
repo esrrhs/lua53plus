@@ -51,7 +51,7 @@ jobs:
 
       - name: Build tests/t_udata.so for GC fuzz userdata paths
         run: |
-          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}' TEST_UDATA_LDFLAGS='-shared ${{ matrix.extra_ldflags }}'
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}'
 
       - name: Run language/stdlib e2e suite (with lua_assert)
         run: |
@@ -90,7 +90,7 @@ jobs:
 
       - name: Build tests/t_udata.so (release)
         run: |
-          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}' TEST_UDATA_LDFLAGS='-shared ${{ matrix.extra_ldflags }}'
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}'
 
       - name: Run language/stdlib e2e suite (release build)
         run: |

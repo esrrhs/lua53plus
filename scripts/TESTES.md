@@ -30,10 +30,12 @@ make test-testes    # builds testes/libs/*.so, runs lua -e'_port=true' all.lua
 CI uses `_port=true` so non-portable checks (notably `files.lua` invalid
 `stdin:seek` when the runner attaches a seekable stdin) are skipped.
 
-On macOS, `make test-testes` adds `-undefined dynamic_lookup` when linking
-`testes/libs/*.so`. For 32-bit Linux or sanitizer builds, pass the extra
-flags through `TESTES_LIBS_CFLAGS` and, when rebuilding with the T module,
-`EXTRA_CFLAGS` / `EXTRA_LDFLAGS` (see `scripts/TESTING.md`).
+On macOS, `make test-testes` and `make test-udata` append
+`-undefined dynamic_lookup` with `override`, so command-line
+`TESTES_LIBS_CFLAGS` / `TEST_UDATA_LDFLAGS` cannot drop it. For 32-bit
+Linux or sanitizer builds, pass extra flags through `TESTES_LIBS_CFLAGS`
+and, when rebuilding with the T module, `EXTRA_CFLAGS` / `EXTRA_LDFLAGS`
+(see `scripts/TESTING.md`).
 
 ## Adaptations
 

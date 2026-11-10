@@ -67,8 +67,9 @@ test-e2e:	dummy
 TEST_UDATA_CFLAGS ?= -std=gnu99 -O2 -fPIC -Isrc
 TEST_UDATA_LDFLAGS ?= -shared
 UNAME_S := $(shell uname -s)
+# Use override: command-line TEST_UDATA_LDFLAGS would otherwise replace +=.
 ifeq ($(UNAME_S),Darwin)
-TEST_UDATA_LDFLAGS += -undefined dynamic_lookup
+override TEST_UDATA_LDFLAGS += -undefined dynamic_lookup
 endif
 tests/t_udata.so: tests/t_udata.c src/lua.h src/lauxlib.h
 	gcc $(TEST_UDATA_CFLAGS) $(TEST_UDATA_LDFLAGS) -o $@ tests/t_udata.c
@@ -79,8 +80,9 @@ test-udata: tests/t_udata.so
 # C modules: override TESTES_LIBS_CFLAGS for -m32 or -fsanitize=...
 # Darwin needs -undefined dynamic_lookup so Lua API symbols resolve at load.
 TESTES_LIBS_CFLAGS ?= -Wall -std=gnu99 -O2 -I../../src -fPIC -shared
+# Use override so TESTES_LIBS_CFLAGS from the command line still gets this flag.
 ifeq ($(UNAME_S),Darwin)
-TESTES_LIBS_CFLAGS += -undefined dynamic_lookup
+override TESTES_LIBS_CFLAGS += -undefined dynamic_lookup
 endif
 
 test-testes-basic:	dummy
