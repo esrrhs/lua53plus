@@ -11,22 +11,23 @@ TGZ="${TMPDIR:-/tmp}/lua-5.3.4-tests.tar.gz"
 # lua.org is occasionally unreachable from some CI runners (commonly an
 # IPv6 connect timeout). Prefer IPv4, then fall back to the default stack.
 # Always verify SHA-256 before extracting. Do not skip official testes.
+# Avoid empty bash arrays: macOS ships bash 3.2, where "${arr[@]}" with
+# set -u aborts as "unbound variable" and skipped the default-stack retry.
 ok=0
 for attempt in 1 2 3; do
-  for mode in ipv4 default; do
-    if [ "$mode" = ipv4 ]; then
-      curl_opts=( -4 )
-    else
-      curl_opts=()
-    fi
-    echo "Downloading $URL ($mode, attempt $attempt) ..."
-    if curl -fsSL "${curl_opts[@]}" --connect-timeout 20 --max-time 180 -o "$TGZ" "$URL"; then
-      ok=1
-      break 2
-    fi
-    echo "curl failed ($mode, attempt $attempt)" >&2
-  done
-  if [ "$ok" -ne 1 ] && [ "$attempt" -lt 3 ]; then
+  echo "Downloading $URL (ipv4, attempt $attempt) ..."
+  if curl -fsSL -4 --connect-timeout 20 --max-time 180 -o "$TGZ" "$URL"; then
+    ok=1
+    break
+  fi
+  echo "curl failed (ipv4, attempt $attempt)" >&2
+  echo "Downloading $URL (default, attempt $attempt) ..."
+  if curl -fsSL --connect-timeout 20 --max-time 180 -o "$TGZ" "$URL"; then
+    ok=1
+    break
+  fi
+  echo "curl failed (default, attempt $attempt)" >&2
+  if [ "$attempt" -lt 3 ]; then
     echo "retrying in $((attempt * 5))s ..." >&2
     sleep $((attempt * 5))
   fi
