@@ -8,19 +8,31 @@ URL="https://www.lua.org/tests/lua-5.3.4-tests.tar.gz"
 SHA256="b80771238271c72565e5a1183292ef31bd7166414cd0d43a8eb79845fa7f599f"
 TGZ="${TMPDIR:-/tmp}/lua-5.3.4-tests.tar.gz"
 
-echo "Downloading $URL ..."
-# lua.org is occasionally unreachable from CI runners; retry with backoff.
+# lua.org is occasionally unreachable from some CI runners (commonly an
+# IPv6 connect timeout). Prefer IPv4, then fall back to the default stack.
+# Always verify SHA-256 before extracting. Do not skip official testes.
 ok=0
-for attempt in 1 2 3 4 5; do
-  if curl -fsSL --connect-timeout 30 --max-time 180 -o "$TGZ" "$URL"; then
-    ok=1
-    break
+for attempt in 1 2 3; do
+  for mode in ipv4 default; do
+    if [ "$mode" = ipv4 ]; then
+      curl_opts=( -4 )
+    else
+      curl_opts=()
+    fi
+    echo "Downloading $URL ($mode, attempt $attempt) ..."
+    if curl -fsSL "${curl_opts[@]}" --connect-timeout 20 --max-time 180 -o "$TGZ" "$URL"; then
+      ok=1
+      break 2
+    fi
+    echo "curl failed ($mode, attempt $attempt)" >&2
+  done
+  if [ "$ok" -ne 1 ] && [ "$attempt" -lt 3 ]; then
+    echo "retrying in $((attempt * 5))s ..." >&2
+    sleep $((attempt * 5))
   fi
-  echo "curl failed (attempt $attempt); retrying in $((attempt * 5))s ..." >&2
-  sleep $((attempt * 5))
 done
 if [ "$ok" -ne 1 ]; then
-  echo "failed to download $URL after retries" >&2
+  echo "failed to download $URL after IPv4 and default retries" >&2
   exit 1
 fi
 echo "$SHA256  $TGZ" | sha256sum -c -

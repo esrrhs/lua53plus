@@ -6,7 +6,9 @@
 ./scripts/fetch_testes.sh
 ```
 
-Downloads https://www.lua.org/tests/lua-5.3.4-tests.tar.gz, verifies SHA-256
+Downloads https://www.lua.org/tests/lua-5.3.4-tests.tar.gz (IPv4 first, then
+the default address family, with retries — some CI runners time out on IPv6
+to lua.org), verifies SHA-256
 `b80771238271c72565e5a1183292ef31bd7166414cd0d43a8eb79845fa7f599f`, extracts
 to `./testes/`, and patches `ltests/ltests.c` for lua53plus gray lists.
 
