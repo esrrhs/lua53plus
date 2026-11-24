@@ -121,3 +121,7 @@ Logs: `/workspace/lua53plus-platform-logs/`.
 The `05-run_sanitizer_tests-linux.log` run is the same path CI `asan-ubuntu` uses
 (`./scripts/run_sanitizer_tests.sh linux` with `DETECT_LEAKS=1` and
 `RUN_FULL_TESTES=1`).
+
+## GC invariants, OOM and reproducible metrics
+
+See [GC_VALIDATION.md](GC_VALIDATION.md) for the GC-state rationale, directed/negative tests, failing allocator, and equal-flags baseline methodology. Run `scripts/run_gc_validation.sh ltests` after the T build, or `release` with the ordinary library. Run `python3 scripts/bench_gc_regression.py` for raw JSON and repeated medians. Performance gates are opt-in via `GC_BENCH_LIMITS`; CI stays report-only until target-runner noise budgets are calibrated.

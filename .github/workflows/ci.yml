@@ -79,6 +79,9 @@ jobs:
           EXTRA_LDFLAGS: ${{ matrix.extra_ldflags }}
         run: |
           ./scripts/build_with_ltests.sh ${{ matrix.target }}
+          make test-udata TEST_UDATA_CFLAGS='-std=gnu99 -O2 -fPIC -Isrc ${{ matrix.extra_cflags }}'
+          FUZZ_REQUIRE_UDATA=1 FUZZ_OPS=5000 ./src/lua tests/test_gc_fuzz.lua
+          EXTRA_CFLAGS='${{ matrix.extra_cflags }}' EXTRA_LDFLAGS='${{ matrix.extra_ldflags }}' ./scripts/run_gc_validation.sh ltests
           make test-testes TESTES_LIBS_CFLAGS='-Wall -std=gnu99 -O2 -I../../src -fPIC -shared ${{ matrix.extra_cflags }}'
 
       - name: Rebuild clean release binaries
@@ -126,6 +129,21 @@ jobs:
           ./src/lua bench/bench_gc_manualstep.lua
           ./src/lua bench/bench_table_lookup.lua
           ./src/lua bench/bench_mixed_workload.lua
+
+      - name: Reproducible GC metrics vs official 5.3.4 (report-only until calibrated)
+        if: matrix.name == 'ubuntu-linux'
+        run: |
+          python3 tests/test_gc_bench_limits.py
+          python3 scripts/bench_gc_regression.py
+
+      - name: Upload GC metrics and negative-check logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gc-validation-${{ matrix.name }}
+          path: |
+            validation-results/benchmark/metrics.json
+            validation-results/negative-*.log
 
   # AddressSanitizer + UndefinedBehaviorSanitizer. Errors must fail the job
   # (halt_on_error=1). LSan is on for Linux; it is not usable on macOS.

@@ -9,3 +9,7 @@ luac.out
 
 # Official PUC-Lua testes (fetched by scripts/fetch_testes.sh)
 /testes/
+
+# Reproducible local GC validation / benchmark outputs
+/validation-results/
+__pycache__/

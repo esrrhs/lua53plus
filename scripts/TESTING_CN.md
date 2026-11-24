@@ -113,3 +113,7 @@ gcc 14.2.0，仓库基线 `9953963` 加上本次未提交的平台测试改动�
 
 `05-run_sanitizer_tests-linux.log` 与 CI 中 `asan-ubuntu` 的路径相同
 （`./scripts/run_sanitizer_tests.sh linux`，`DETECT_LEAKS=1`，`RUN_FULL_TESTES=1`）。
+
+## GC 深度验证与性能对照
+
+见 [GC_VALIDATION.md](GC_VALIDATION.md)：T+fuzz、链表负向检查、OOM 注入、官方 baseline 的单调时钟测量和可配置门禁。

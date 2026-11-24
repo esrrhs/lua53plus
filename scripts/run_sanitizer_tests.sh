@@ -71,6 +71,9 @@ rm -f tests/t_udata.so
 make test-udata TEST_UDATA_CFLAGS="$UDATA_CFLAGS"
 ./src/lua -v
 
+echo "==== directed GC / failing allocator (ASan+UBSan) ===="
+EXTRA_CFLAGS="$SAN_CFLAGS" EXTRA_LDFLAGS="$SAN_LDFLAGS" ./scripts/run_gc_validation.sh release
+
 echo "==== e2e (ASan+UBSan) ===="
 ./src/lua tests/e2e/run_all.lua
 
@@ -91,6 +94,9 @@ if [ "$RUN_FULL_TESTES" = 1 ]; then
   EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $EXTRA_CFLAGS" \
   EXTRA_LDFLAGS="-fsanitize=address,undefined $EXTRA_LDFLAGS" \
     ./scripts/build_with_ltests.sh "$PLAT"
+  EXTRA_CFLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $EXTRA_CFLAGS" \
+  EXTRA_LDFLAGS="$SAN_LDFLAGS" ./scripts/run_gc_validation.sh ltests
+  ./src/lua tests/test_gc_fuzz.lua
   make test-testes TESTES_LIBS_CFLAGS="-Wall -std=gnu99 -O1 -g -fPIC -shared -I../../src -fsanitize=address,undefined $EXTRA_CFLAGS"
 fi
 
