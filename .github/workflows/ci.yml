@@ -181,3 +181,29 @@ jobs:
       - name: Build and run e2e, GC fuzz (udata required), and official testes under ASan+UBSan
         run: |
           ./scripts/run_sanitizer_tests.sh ${{ matrix.target }}
+
+  coverage:
+    name: coverage-ubuntu
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install lcov
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov
+          lcov --version
+
+      - name: Build and collect merged src/* coverage (standard + ltests suites)
+        run: |
+          ./scripts/run_coverage.sh
+
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: validation-results/coverage.info
+          disable_search: true
+          fail_ci_if_error: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+          verbose: true

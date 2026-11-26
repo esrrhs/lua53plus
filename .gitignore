@@ -2,6 +2,8 @@
 *.a
 *.so
 *.dylib
+*.gcda
+*.gcno
 src/lua
 src/luac
 src/liblua.a

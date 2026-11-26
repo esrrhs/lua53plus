@@ -1,6 +1,7 @@
 # lua53plus
 
 [![CI](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/esrrhs/lua53plus/graph/badge.svg)](https://codecov.io/gh/esrrhs/lua53plus)
 [![Sanitizers](https://img.shields.io/badge/sanitizers-ASan%20%7C%20UBSan%20%7C%20LSan-brightgreen.svg)](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml)
 [![Lua 5.3.4](https://img.shields.io/badge/Lua-5.3.4%20drop--in-2C2D72.svg?logo=lua&logoColor=white)](https://www.lua.org/manual/5.3/)
 [![Top Language](https://img.shields.io/github/languages/top/esrrhs/lua53plus.svg)](https://github.com/esrrhs/lua53plus)
