@@ -119,8 +119,7 @@ static GCObject **getgclist (GCObject *o) {
     case LUA_TLCL: return &gco2lcl(o)->gclist;
     case LUA_TCCL: return &gco2ccl(o)->gclist;
     case LUA_TTHREAD: return &gco2th(o)->gclist;
-    case LUA_TPROTO: return &gco2p(o)->gclist;
-    default: lua_assert(0); return NULL;
+    default: lua_assert(o->tt == LUA_TPROTO); return &gco2p(o)->gclist;
   }
 }
 
@@ -142,11 +141,8 @@ static void setlistprev (GCObject *o, GCObject *prev) {
 
 
 static GCObject *getlistprev (GCObject *o) {
-  if (o->tt == LUA_TTABLE)
-    return gco2t(o)->listprev;
-  if (o->tt == LUA_TUSERDATA)
-    return gco2u(o)->listprev;
-  return NULL;
+  lua_assert(haslistprev(o));
+  return (o->tt == LUA_TTABLE) ? gco2t(o)->listprev : gco2u(o)->listprev;
 }
 
 
@@ -171,41 +167,21 @@ static GCObject *popoldgc (global_State *g) {
 
 
 /*
-** Unlink 'o' from oldgc. Table/Udata use listprev for O(1); on mismatch
-** (should not happen) fall back to a linear scan and repair listprev.
+** Unlink Table/Udata 'o' from oldgc in O(1) using 'listprev'.
 */
-static int unlinkoldgc (global_State *g, GCObject *o) {
-  GCObject **p;
-  GCObject *prev = NULL;
-  if (haslistprev(o)) {
-    prev = getlistprev(o);
-    if (prev == NULL) {
-      if (g->oldgc == o) {
-        g->oldgc = o->next;
-        if (o->next != NULL)
-          setlistprev(o->next, NULL);
-        setlistprev(o, NULL);
-        return 1;
-      }
-    }
-    else if (prev->next == o) {
-      prev->next = o->next;
-      if (o->next != NULL)
-        setlistprev(o->next, prev);
-      setlistprev(o, NULL);
-      return 1;
-    }
+static void unlinkoldgc (global_State *g, GCObject *o) {
+  GCObject *prev = getlistprev(o);
+  if (prev == NULL) {
+    lua_assert(g->oldgc == o);
+    g->oldgc = o->next;
   }
-  /* linear fallback (non-TU or inconsistent listprev) */
-  prev = NULL;
-  for (p = &g->oldgc; *p != NULL && *p != o; p = &(*p)->next)
-    prev = *p;
-  if (*p != o) return 0;
-  *p = o->next;
+  else {
+    lua_assert(prev->next == o);
+    prev->next = o->next;
+  }
   if (o->next != NULL)
     setlistprev(o->next, prev);
   setlistprev(o, NULL);
-  return 1;
 }
 
 
@@ -1149,16 +1125,6 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
     if (isdeadm(ow, marked)) {  /* is 'curr' dead? */
       freeobj(L, curr);  /* erase 'curr' */
     }
-    else if (iswhite(curr)) {
-      /* 'makewhite' was called by barrier during sweep; keep as young white */
-      if (curr->tt == LUA_TTABLE)
-        gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
-      curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                     bitmask(OLDBIT) |
-                     bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) | white);
-      curr->next = g->allgc;
-      g->allgc = curr;
-    }
     else if (curr->tt == LUA_TTHREAD) {
       curr->marked = cast_byte((marked & ~(bitmask(BLACKBIT) | WHITEBITS |
                      bitmask(OLDBIT) |
@@ -1395,46 +1361,44 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
   else {  /* move 'o' to 'finobj' list */
     GCObject **p;
     if (isold(o)) {
-      /* O(1) for Table/Udata via listprev; linear fallback otherwise */
-      if (unlinkoldgc(g, o)) {
-        if (g->oldcount > 0)
-          g->oldcount--;
-        if (keepinvariant(g)) {
-          resetbit(o->marked, OLDBIT);
-          l_setbit(o->marked, FINALIZEDBIT);
-          o->next = g->finobj;
-          g->finobj = o;
-          g->needmajor = 1;
-        }
-        else {
-          if (testbit(o->marked, TOUCHEDBIT)) {
-            GCObject **pg;
-            if (o->tt == LUA_TUSERDATA) {
-              for (pg = &g->remudata; *pg != NULL && *pg != o; pg = &gco2u(*pg)->gclist) { /* empty */ }
-              if (*pg == o) *pg = gco2u(o)->gclist;
-            }
-            else {
-              for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
-              if (*pg == o) *pg = *getgclist(o);
-            }
-          }
-          if (o->tt == LUA_TTABLE)
-            gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
-          o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                      bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
-                      bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
-          if (g->inbleach) {
-            if (g->finobj == NULL)
-              g->fintail = &o->next;
+      unlinkoldgc(g, o);
+      if (g->oldcount > 0)
+        g->oldcount--;
+      if (keepinvariant(g)) {
+        resetbit(o->marked, OLDBIT);
+        l_setbit(o->marked, FINALIZEDBIT);
+        o->next = g->finobj;
+        g->finobj = o;
+        g->needmajor = 1;
+      }
+      else {
+        if (testbit(o->marked, TOUCHEDBIT)) {
+          GCObject **pg;
+          if (o->tt == LUA_TUSERDATA) {
+            for (pg = &g->remudata; *pg != NULL && *pg != o; pg = &gco2u(*pg)->gclist) { /* empty */ }
+            if (*pg == o) *pg = gco2u(o)->gclist;
           }
           else {
-            g->needmajor = 1;
+            for (pg = &g->grayagain; *pg != NULL && *pg != o; pg = getgclist(*pg)) { /* empty */ }
+            if (*pg == o) *pg = *getgclist(o);
           }
-          o->next = g->finobj;
-          g->finobj = o;
         }
-        return;
+        if (o->tt == LUA_TTABLE)
+          gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
+        o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                    bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                    bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
+        if (g->inbleach) {
+          if (g->finobj == NULL)
+            g->fintail = &o->next;
+        }
+        else {
+          g->needmajor = 1;
+        }
+        o->next = g->finobj;
+        g->finobj = o;
       }
+      return;
     }
     for (p = &g->allgc; *p != NULL && *p != o; p = &(*p)->next) { /* empty */ }
     if (*p == o) {

@@ -537,29 +537,11 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
 
 
 /*
-** search function for short strings
-** Unrolls the primary bucket check with branch-prediction hint before
-** walking any collision chain.
+** search function for short strings (out-of-line entry point)
 */
 const TValue *luaH_getshortstr (Table *t, TString *key) {
-  Node *n = hashstr(t, key);
-  const TValue *k = gkey(n);
   lua_assert(key->tt == LUA_TSHRSTR);
-  if (l_likely(ttisshrstring(k) && eqshrstr(tsvalue(k), key)))
-    return gval(n);  /* hit at main position */
-  {
-    int nx = gnext(n);
-    if (nx == 0)
-      return luaO_nilobject;  /* not found */
-    do {  /* follow collision chain */
-      n += nx;
-      k = gkey(n);
-      if (ttisshrstring(k) && eqshrstr(tsvalue(k), key))
-        return gval(n);  /* that's it */
-      nx = gnext(n);
-    } while (nx != 0);
-    return luaO_nilobject;  /* not found */
-  }
+  return luaH_fastgetshortstr(t, key);
 }
 
 

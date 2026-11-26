@@ -10,6 +10,8 @@
 #include "lgc.h"
 #include "lfunc.h"
 #include "lobject.h"
+#include "lstring.h"
+#include "ltable.h"
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); exit(1); } } while (0)
 typedef struct Alloc {
@@ -254,11 +256,177 @@ static void corrupt(const char *kind) {
   fprintf(stderr,"checker FAILED to reject corruption: %s\n",kind); exit(2);
 }
 #endif
+static int adv_swpallgc(lua_State *L) {
+  lua_gc(L, LUA_GCRESTART, 0);
+  state(L, GCSpropagate);
+  state(L, GCSswpallgc);
+  lua_gc(L, LUA_GCSTOP, 0); /* freeze sweep until LoadDebug + fn() set white Proto->cache */
+  return 0;
+}
+
+static void coverage_edges(void) {
+  /* 1. remudata surviving into restartcollection (clearremlists mark=1) +
+        out-of-line luaH_getshortstr / luaH_getstr / luaH_get entry points */
+  {
+    Alloc a = {0}; lua_State *L = prepare(&a);
+    Table *gt; TString *ks; TValue tvk;
+    run(L, "kshort = 321; debug.setmetatable(roots[10], { tag = 'ud_mt' }); "
+           "debug.setuservalue(roots[10], { uv_ok = 777 })");
+    /* Also exercise old CClosure forward-to-grayagain barrier (getgclist LUA_TCCL) */
+    lua_newtable(L);
+    lua_pushcclosure(L, adv_swpallgc, 1);
+    lua_setglobal(L, "old_ccl");
+    cycle(L);
+    lua_getglobal(L, "old_ccl");
+    lua_newtable(L);
+    CHECK(lua_setupvalue(L, -2, 1) != NULL);
+    lua_pop(L, 1);
+    cycle(L);
+    run(L, "debug.setmetatable(roots[10], { tag = 'ud_mt' }); "
+           "debug.setuservalue(roots[10], { uv_ok = 777 })");
+    CHECK(G(L)->remudata != NULL);
+    checkmem(L);
+    lua_getglobal(L, "_G");
+    gt = hvalue(L->top - 1);
+    ks = luaS_new(L, "kshort");
+    setsvalue(L, &tvk, ks);
+    CHECK(ivalue(luaH_getshortstr(gt, ks)) == 321);
+    CHECK(ivalue(luaH_getstr(gt, ks)) == 321);
+    CHECK(ivalue(luaH_get(gt, &tvk)) == 321);
+    lua_pop(L, 1);
+    cycle(L); /* restartcollection -> clearremlists(g, 1) marks metatable + uservalue */
+    run(L, "assert(debug.getmetatable(roots[10]).tag == 'ud_mt' and "
+           "debug.getuservalue(roots[10]).uv_ok == 777)");
+
+    /* 2. TOUCHEDBIT udata in sweeptobeswept & sweepfinobj, TOUCHEDBIT table in sweepfinobj */
+    lua_gc(L, LUA_GCSTOP, 0);
+    run(L, "yu = newud(); yufin = debug.setmetatable(newud(), mt); ytfin = setmetatable({}, mt); "
+           "ypad = {}; ypadfin = {}; "
+           "for i = 1, 300 do ypad[i] = newud(); ypadfin[i] = setmetatable({}, mt) end");
+    lua_gc(L, LUA_GCRESTART, 0);
+    state(L, GCSswpallgc);
+    lua_gc(L, LUA_GCSTOP, 0); /* keep yu in tobeswept while Lua mutates its uservalue */
+    CHECK(G(L)->tobeswept && G(L)->tobesweptfin);
+    run(L, "debug.setuservalue(yu, { a = 11 }); "
+           "debug.setuservalue(yufin, { b = 22 }); "
+           "ytfin.c = { d = 33 }");
+    checkmem(L);
+    lua_gc(L, LUA_GCRESTART, 0);
+    state(L, GCSpause);
+    cycle(L);
+    run(L, "assert(debug.getuservalue(yu).a == 11 and "
+           "debug.getuservalue(yufin).b == 22 and ytfin.c.d == 33)");
+
+    /* 3. oldweakcount > (lastmajweak << 1) on >10,000-object old heap (no earlier || short-circuit) */
+    run(L, "extra_old = {}; for i = 1, 8000 do extra_old[i] = { i } end");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    run(L, "wmt = { __mode = 'v' }; wpool = {}; for i = 1, 300 do wpool[i] = setmetatable({}, wmt) end");
+    cycle(L); /* minor cycle promotes 300 weak tables into oldweak without exceeding +25% oldcount */
+    CHECK(!G(L)->ismajor && G(L)->oldweakcount >= 300);
+    lua_gc(L, LUA_GCSTEP, 0); /* hits oldweakcount > (lastmajweak << 1) -> startbleach */
+    CHECK(G(L)->inbleach);
+    while (G(L)->inbleach) { lua_gc(L, LUA_GCSTEP, 0); checkmem(L); }
+    state(L, GCSpause);
+
+    /* 4. >192 MB setpause 24 MB cap (both oldgc != NULL and emergency fullgc oldgc == NULL) */
+    lua_newuserdata(L, 200u * 1024u * 1024u);
+    lua_setglobal(L, "bigud");
+    lua_gc(L, LUA_GCCOLLECT, 0); /* hits maxpause = 24MB with oldgc != NULL */
+    CHECK(G(L)->oldgc != NULL);
+    a.once = 1;
+    a.failat = a.calls + 1;
+    (void)lua_newuserdata(L, 64); /* triggers emergency luaC_fullgc(L, 1) -> oldgc == NULL, >192MB */
+    lua_pop(L, 1);
+    a.failat = 0;
+    CHECK(G(L)->oldgc == NULL);
+    lua_pushnil(L);
+    lua_setglobal(L, "bigud");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+
+    /* 5. lua_close (luaC_freeallobjects) mid-sweep while both tobeswept and tobesweptfin are active */
+    phase(L, 2);
+    CHECK(G(L)->tobeswept && G(L)->tobesweptfin);
+    closecheck(L, &a);
+  }
+
+  /* 6. Old tables dynamically made weak ('v' & 'k') with 0 clearable entries in atomic,
+        non-promoting stopped-sweep barrierback & checkfinalizer sweepgc cursor,
+        udata2finalize sweepgc == &o->next, and Proto->cache drop in sweeptobeswept */
+  {
+    Alloc a = {0}; lua_State *L = lua_newstate(allocf, &a);
+    CHECK(L);
+    luaL_openlibs(L);
+    lua_pushcfunction(L, adv_swpallgc);
+    lua_setglobal(L, "adv_swpallgc");
+
+    /* 6a. traverseweakvalue / traverseephemeron else if (isold(h)) with hasclears == 0 */
+    run(L, "wv = {}; wk = {}; mt_v = {}; mt_k = {}; pad_old = {}; "
+           "for i = 1, 2000 do pad_old[i] = { i } end");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    run(L, "mt_v.__mode = 'v'; rawset(mt_k, '__mode', 'k')"); /* hits lvm.c:221 & lapi.c:813 */
+    lua_gc(L, LUA_GCCOLLECT, 0); /* clear needmajor while wv/wk remain strong old tables */
+    state(L, GCSpropagate);
+    CHECK(!G(L)->ismajor);
+    run(L, "keep_y = {}; setmetatable(wv, mt_v); setmetatable(wk, mt_k); "
+           "wv.only = keep_y; wk[keep_y] = 1");
+    state(L, GCSpause);
+    checkmem(L);
+    run(L, "assert(wv.only == keep_y and wk[keep_y] == 1)");
+
+    /* 6b. Non-promoting stopped sweep: luaC_barrierback_ makewhite & checkfinalizer sweepgc cursor */
+    lua_gc(L, LUA_GCSTOP, 0);
+    run(L, "gc_mt2 = { __gc = function() end }; s1 = {}");
+    state(L, GCSpropagate);
+    lua_newtable(L); /* exact head of g->allgc after mergeoldgen, kept live on stack */
+    state(L, GCSswpallgc);
+    CHECK(G(L)->tobeswept == NULL && G(L)->sweepgc == &gcvalue(L->top - 1)->next);
+    lua_getglobal(L, "gc_mt2");
+    lua_setmetatable(L, -2); /* hits g->sweepgc == &o->next -> sweeptolive */
+    lua_pop(L, 1);
+    run(L, "s1.child = { 42 }"); /* hits luaC_barrierback_ makewhite */
+    state(L, GCSpause);
+    checkmem(L);
+    lua_gc(L, LUA_GCRESTART, 0);
+
+    /* 6c. Proto in tobeswept turned gray via LoadDebug barrier + white cache cleared in sweeptobeswept */
+    run(L, "local d = string.dump(function() local loc = 1; return function() return loc end end, false); "
+           "for sp = #d - 24, #d - 2, 2 do "
+           "  local idx = 0 "
+           "  local fn = assert(load(function() "
+           "    idx = idx + 1 "
+           "    if idx == 1 then return d:sub(1, sp) end "
+           "    if idx == 2 then adv_swpallgc(); return d:sub(sp + 1) end "
+           "    return nil "
+           "  end)) "
+           "  fn() "
+           "  collectgarbage('restart') "
+           "  while not collectgarbage('step', 1000) do end "
+           "end");
+    state(L, GCSpause);
+    checkmem(L);
+
+    /* 6d. udata2finalize hitting g->sweepgc == &o->next during GCSswptobefnz */
+    lua_gc(L, LUA_GCSTOP, 0);
+    run(L, "fin_cnt = 0; fin_mt = { __gc = function() fin_cnt = fin_cnt + 1 end }; "
+           "for i = 1, 4500 do setmetatable({}, fin_mt) end");
+    lua_gc(L, LUA_GCRESTART, 0);
+    state(L, GCSswptobefnz);
+    while (G(L)->gcstate == GCSswptobefnz)
+      lua_gc(L, LUA_GCSTEP, 0);
+    state(L, GCSpause);
+    run(L, "assert(fin_cnt == 4500)");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    checkmem(L);
+    closecheck(L, &a);
+  }
+  puts("coverage_edges: remudata / mid-sweep close / 0-clear oldweak / 24MB pause / proto cache OK");
+}
+
 int main(int argc, char **argv) {
 #ifdef GC_WITH_LTESTS
   if (argc==2) { corrupt(argv[1]); return 2; }
 #else
   (void)argc; (void)argv;
 #endif
-  directed(); oom(); finalizer_oom(); return 0;
+  directed(); coverage_edges(); oom(); finalizer_oom(); return 0;
 }

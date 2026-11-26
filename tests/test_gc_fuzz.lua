@@ -692,6 +692,15 @@ local function test_gc_adversarial_edge_cases()
     assert(registered, "userdata finalizer from tobeswept+remudata path should run")
   end
 
+  -- 3i. Malformed precompiled chunk with NULL (size=0) string constant rejected cleanly
+  do
+    local good = string.dump(function() return "const_abc" end, true)
+    local pos = assert(good:find("\x0aconst_abc", 1, true))
+    local bad = good:sub(1, pos - 1) .. "\x00" .. good:sub(pos + 10)
+    local fn, err = load(bad, "bad_chunk", "b")
+    assert(fn == nil and type(err) == "string" and err:find("corrupted", 1, true))
+  end
+
   resident = nil
   collectgarbage("collect")
   io.write("OK\n")
