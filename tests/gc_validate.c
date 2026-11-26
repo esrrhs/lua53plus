@@ -473,6 +473,10 @@ static void coverage_edges(void) {
     G(L)->sweepgc = &G(L)->tobefnz->next;
     G(L)->gcstate = GCScallfin;
     lua_gc(L, LUA_GCSTEP, 0);
+    /* GCScallfin is only entered after GCSswpend stores sweepgc = NULL.
+       The step above rewrites the cursor to &tobefnz; drop it before a
+       full collection, which asserts the cursor is clear in entersweep. */
+    G(L)->sweepgc = NULL;
     run(L, "assert(nfin7 >= 1)");
     lua_gc(L, LUA_GCCOLLECT, 0);
     checkmem(L);
