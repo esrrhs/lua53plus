@@ -1,6 +1,14 @@
 # lua53plus
 
-[![CI](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml/badge.svg)](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml)
+[![CI](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml)
+[![Sanitizers](https://img.shields.io/badge/sanitizers-ASan%20%7C%20UBSan%20%7C%20LSan-brightgreen.svg)](https://github.com/esrrhs/lua53plus/actions/workflows/ci.yml)
+[![Lua 5.3.4](https://img.shields.io/badge/Lua-5.3.4%20drop--in-2C2D72.svg?logo=lua&logoColor=white)](https://www.lua.org/manual/5.3/)
+[![Top Language](https://img.shields.io/github/languages/top/esrrhs/lua53plus.svg)](https://github.com/esrrhs/lua53plus)
+[![C Standard](https://img.shields.io/badge/C-C89%20%2F%20C99-00599C.svg?logo=c&logoColor=white)](./src/Makefile)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20POSIX-informational.svg)](./scripts/TESTING_CN.md)
+[![License: MIT](https://img.shields.io/github/license/esrrhs/lua53plus.svg)](./LICENSE)
+[![Last Commit](https://img.shields.io/github/last-commit/esrrhs/lua53plus.svg)](https://github.com/esrrhs/lua53plus/commits/master)
+[![GitHub Stars](https://img.shields.io/github/stars/esrrhs/lua53plus.svg)](https://github.com/esrrhs/lua53plus/stargazers)
 
 [English Documentation (README.md)](./README.md)
 
@@ -306,4 +314,4 @@ make test-testes-basic
 
 ## 开源协议
 
-与 PUC-Lua 5.3.4 相同 —— [MIT License](http://www.lua.org/license.html)。
+与 PUC-Lua 5.3.4 相同 —— [MIT License](./LICENSE)（[Lua 官方协议说明](https://www.lua.org/license.html)）。
