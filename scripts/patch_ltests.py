@@ -102,8 +102,8 @@ old_uv = """      if (!upisopen(uv))  /* only closed upvalues matter to invarian
 new_uv = """      if (!upisopen(uv)) {
         UpVal *r;
         for (r = g->remuv; r && r != uv; r = r->remnext) { /* empty */ }
-        lua_assert((r == uv) == (uv->inrem != 0));
-        if (!keepinvariant(g) && r == uv && uv->inrem) {
+        lua_assert((r == uv) == upisinrem(uv));
+        if (!keepinvariant(g) && r == uv && upisinrem(uv)) {
           lua_assert(!iscollectable(uv->v) ||
                      (righttt(uv->v) && !isdead(g, gcvalue(uv->v))));
         }
@@ -210,8 +210,13 @@ static void checkgenlists (global_State *g) {
     lua_assert(u != v);
   }
   for (u = g->remuv; u; u = u->remnext) {
-    lua_assert(u->inrem && !upisopen(u));
+    lua_assert(upisinrem(u) && !upisopen(u));
     /* refcount == 0 is intentional: deferred freeing by clearremlists. */
+  }
+  {
+    lu_mem nweak = 0;
+    for (o = g->oldweak; o; o = graynext(o)) nweak++;
+    lua_assert(nweak == g->oldweakcount);
   }
   {
     GCObject *slow = g->remudata, *fast = g->remudata;

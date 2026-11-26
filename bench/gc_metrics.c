@@ -16,6 +16,7 @@
 #include "lauxlib.h"
 #include "lualib.h"
 #include "lobject.h" /* sizeof-only layout accounting, never collector controls */
+#include "lfunc.h"
 typedef struct Memory { size_t live, peak; } Memory;
 static void *mem(void *ud,void *p,size_t old,size_t n) {
   Memory *m=ud; void *q;
@@ -82,7 +83,7 @@ int main(int argc,char **argv) {
   start=now(); lua_gc(L,LUA_GCCOLLECT,0); lua_gc(L,LUA_GCCOLLECT,0);
   drain=now()-start; postcollect=m.live;
   qsort(pauses,(size_t)n,sizeof(double),cmp); qsort(batches,(size_t)n,sizeof(double),cmp);
-  printf("{\"samples\":%d,\"seed\":101,\"seconds\":%.9f,\"gc_p99_us\":%.6f,\"gc_max_us\":%.6f,\"batch_p99_us\":%.6f,\"batch_max_us\":%.6f,\"lua_peak_bytes\":%zu,\"lua_live_bytes\":%zu,\"rss_bytes\":%zu,\"rss_peak_bytes\":%zu,\"sizeof_table\":%zu,\"sizeof_udata\":%zu",n,elapsed,pauses[(99*n+99)/100-1],pauses[n-1],batches[(99*n+99)/100-1],batches[n-1],m.peak,live,resident,peakrss,sizeof(Table),sizeof(Udata));
+  printf("{\"samples\":%d,\"seed\":101,\"seconds\":%.9f,\"gc_p99_us\":%.6f,\"gc_max_us\":%.6f,\"batch_p99_us\":%.6f,\"batch_max_us\":%.6f,\"lua_peak_bytes\":%zu,\"lua_live_bytes\":%zu,\"rss_bytes\":%zu,\"rss_peak_bytes\":%zu,\"sizeof_table\":%zu,\"sizeof_udata\":%zu,\"sizeof_upval\":%zu",n,elapsed,pauses[(99*n+99)/100-1],pauses[n-1],batches[(99*n+99)/100-1],batches[n-1],m.peak,live,resident,peakrss,sizeof(Table),sizeof(Udata),sizeof(UpVal));
   printf(",\"drain_full_gc_us\":%.6f,\"seconds_with_drain\":%.9f,\"lua_post_collect_bytes\":%zu}\n",drain*1e6,elapsed+drain,postcollect);
   lua_close(L); free(pauses); free(batches); return m.live ? 1:0;
 }

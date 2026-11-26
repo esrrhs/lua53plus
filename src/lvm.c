@@ -215,11 +215,10 @@ void luaV_finishset (lua_State *L, const TValue *t, TValue *key,
         /* no metamethod and (now) there is an entry with given key */
         setobj2t(L, cast(TValue *, slot), val);  /* set its new value */
         invalidateTMcache(h);
-        if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE]) {
-          h->flags |= cast_byte(TM_HASMODE);
-          if (!iswhite(h))
-            G(L)->needmajor = 1;
-        }
+        if (l_unlikely(ttisshrstring(key) &&
+                       tsvalue(key) == G(L)->tmname[TM_MODE] &&
+                       !iswhite(h)))
+          G(L)->needmajor = 1;
         luaC_barrierback(L, h, val);
         return;
       }

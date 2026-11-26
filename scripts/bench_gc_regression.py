@@ -22,7 +22,7 @@ plus = OUT / 'plus'
 (plus / 'src').mkdir(parents=True, exist_ok=True)
 for p in (ROOT / 'src').iterdir():
     if p.suffix in ('.c','.h') or p.name == 'Makefile': shutil.copy2(p,plus / 'src' / p.name)
-cc = shlex.split(os.environ.get('CC','cc'))
+cc = shlex.split(os.environ.get('CC', 'cc' if sys.platform == 'darwin' else 'gcc'))
 cflags = shlex.split(os.environ.get('GC_BENCH_CFLAGS','-O2 -std=gnu99 -DLUA_USE_POSIX -DLUA_USE_DLOPEN'))
 ldflags = shlex.split(os.environ.get('GC_BENCH_LDFLAGS','-lm' + ('' if sys.platform=='darwin' else ' -ldl')))
 for name, directory in [('baseline',base),('plus',plus)]:

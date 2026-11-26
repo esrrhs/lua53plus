@@ -86,7 +86,7 @@ make test-testes TESTES_LIBS_CFLAGS='-Wall -std=gnu99 -O2 -I../../src -fPIC -sha
 ./scripts/run_sanitizer_tests.sh macosx
 
 # 可选环境变量：BITS=32 DETECT_LEAKS=0|1 RUN_FULL_TESTES=0|1 FUZZ_OPS=6000
-#                FETCH_TESTES=1 EXTRA_CFLAGS EXTRA_LDFLAGS
+#                FETCH_TESTES=1 EXTRA_CFLAGS EXTRA_LDFLAGS ASAN_EXTRA_OPTIONS
 ```
 
 Sanitizer 选项基线（脚本也会设置）：

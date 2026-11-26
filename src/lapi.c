@@ -743,7 +743,7 @@ static void auxsetstr (lua_State *L, const TValue *t, const char *k) {
   const TValue *slot;
   TString *str = luaS_new(L, k);
   api_checknelems(L, 1);
-  if (luaV_fastset(L, t, str, slot, luaH_fastgetstr, L->top - 1))
+  if (luaV_fastsetstr(L, t, str, slot, L->top - 1))
     L->top--;  /* pop value */
   else {
     setsvalue2s(L, L->top, str);  /* push 'str' (to make it a TValue) */
@@ -785,7 +785,7 @@ LUA_API void lua_seti (lua_State *L, int idx, lua_Integer n) {
   lua_lock(L);
   api_checknelems(L, 1);
   t = index2addr(L, idx);
-  if (luaV_fastset(L, t, n, slot, luaH_getint, L->top - 1))
+  if (luaV_fastsetraw(L, t, n, slot, luaH_getint, L->top - 1))
     L->top--;  /* pop value */
   else {
     setivalue(L->top, n);
@@ -807,11 +807,10 @@ LUA_API void lua_rawset (lua_State *L, int idx) {
   slot = luaH_set(L, hvalue(o), L->top - 2);
   setobj2t(L, slot, L->top - 1);
   invalidateTMcache(hvalue(o));
-  if (ttisshrstring(L->top - 2) && tsvalue(L->top - 2) == G(L)->tmname[TM_MODE]) {
-    hvalue(o)->flags |= cast_byte(TM_HASMODE);
-    if (!iswhite(hvalue(o)))
-      G(L)->needmajor = 1;
-  }
+  if (l_unlikely(ttisshrstring(L->top - 2) &&
+                 tsvalue(L->top - 2) == G(L)->tmname[TM_MODE] &&
+                 !iswhite(hvalue(o))))
+    G(L)->needmajor = 1;
   luaC_barrierback(L, hvalue(o), L->top-1);
   L->top -= 2;
   lua_unlock(L);

@@ -93,7 +93,7 @@ then (default) a ltests rebuild and the complete official suite.
 ./scripts/run_sanitizer_tests.sh macosx
 
 # Optional env: BITS=32 DETECT_LEAKS=0|1 RUN_FULL_TESTES=0|1 FUZZ_OPS=6000
-#               FETCH_TESTES=1 EXTRA_CFLAGS EXTRA_LDFLAGS
+#               FETCH_TESTES=1 EXTRA_CFLAGS EXTRA_LDFLAGS ASAN_EXTRA_OPTIONS
 ```
 
 Sanitizer option baseline (also set by the script):

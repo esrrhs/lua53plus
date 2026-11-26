@@ -131,7 +131,7 @@ allgc: [临时对象1] -> [临时对象2] -> [常驻对象1] -> [常驻对象2] 
 #### 1. 什么时候触发大扫除（Major GC）？
 `lua53plus` 结合**真实存活字节数**与**周期上限**自动启动 Major GC：
 - Minor GC 清扫结束后的存活内存字节数比上一次 Major GC 基准增长超过 **20%**（`GCestimate > lastmajbytes * 1.20`），或 GC 启动前总内存超过 `lastmajbytes` 的 **1.33 倍**；
-- 老年代晋升对象数增长超过 **25%**（`oldcount > lastmajcount * 1.25`），或连续完成了 **8 轮 Minor GC**（`minorcycles >= 8`，确保即使启动期出现临时内存峰值，老年代中的死亡对象也能在最多 8 轮内被及时回收并下调基准线）；
+- 老年代晋升对象数增长超过 **25%**（`oldcount > lastmajcount * 1.25`），或 `oldweak` 中累积的存活协程/弱表比上次基准增加超过 256 个且翻倍，或连续完成了 **8 轮 Minor GC**（`minorcycles >= 8`，确保即使启动期出现临时内存峰值，老年代中的死亡对象也能在最多 8 轮内被及时回收并下调基准线）；
 - 用户显式调用 `collectgarbage("collect")`，或对已存活的非白表动态挂载了包含 `__mode` 的弱表元表（`needmajor = 1`）。
 
 #### 2. 为什么 Lua 5.4 的分代 GC 在大扫除时还是会卡？
@@ -172,12 +172,10 @@ Step 2:  再搬 100 个...
 原生 Lua 5.3.4 在这里有三个可以改进的地方，`lua53plus` 一并做了优化：
 
 1. **头文件内联消除函数调用（`luaH_fastgetshortstr`）**：
-   原生 Lua 5.3.4 每次执行字节码 `OP_GETTABLE` / `OP_GETTABUP` / `OP_SELF` 时，都要跨文件调用 `ltable.c` 里的 `luaH_get` 再调 `luaH_getshortstr`。`lua53plus` 在 `ltable.h` 中提供了 `static inline` 的 `luaH_fastgetshortstr` 和 `luaH_fastget`，让编译器直接把查表逻辑内联展开在虚拟机主循环 `luaV_execute` 内部。
-2. **指针优先比较（Pointer-First Comparison）**：
-   在 Lua 5.3 中，所有长度 <= 40 字节的短字符串（`LUA_TSHRSTR`）在全局字符串表里都是**唯一驻留（Interned）**的——也就是说，两个相同的短字符串，它们的内存地址指针必然完全相等。
-   - **原生 Lua 5.3.4** 在哈希桶里找 key 时，先判断 `ttisshrstring(k)`（节点的类型是不是短字符串），再比较指针 `eqshrstr(tsvalue(k), key)`。如果一张表里全是短字符串 key，第一个分支永远为真，但第二次才比指针。
-   - **`lua53plus`** 反过来：**先直接比 64 位指针 `val_(k).gc == obj2gco(key)`**，相等时再验证 `ttisshrstring(k)`！因为不匹配的 key 在第一次指针比较时就 100% 被排除了，CPU 只需要一次寄存器比较就能决定是不是命中，大幅降低了分支预测失败率。
-3. **同缓存行伙伴槽位探测（Cache-Line Buddy Probing）**：
+   原生 Lua 5.3.4 每次执行字节码 `OP_GETTABLE` / `OP_GETTABUP` / `OP_SELF` 时，都要跨文件调用 `ltable.c` 里的 `luaH_get` 再调 `luaH_getshortstr`。`lua53plus` 在 `ltable.h` 中提供了 `static inline` 的 `luaH_fastgetshortstr` 和 `luaH_fastget`（配合 `l_likely` 主桶分支预测提示与整数数组边界内联检查），让编译器直接把查表逻辑内联展开在虚拟机主循环 `luaV_execute` 内部。
+2. **哈希表扩容直接插入（`luaH_resize`）**：
+   在 `luaH_resize` 重建新哈希数组时，由于旧节点中的有效键天然唯一且新表为空，`lua53plus` 直接落入新数组槽位或调用 `luaH_newkey` 插入，省去了原生 `luaH_set` 每次插入前多余的整链查找。
+3. **同缓存行伙伴槽位探测（`getfreepos`）**：
    当两个不同的 key 算出了同一个哈希桶位置（发生哈希冲突）时，原生 Lua 会从表尾指针 `lastfree` 倒着随便找一个空位塞进去，导致冲突链上的两个节点在内存里相隔十万八千里，查表时引发多次 CPU 缓存未命中（Cache Miss）。
    `lua53plus` 在 `getfreepos` 分配冲突节点时，**优先检查当前哈希桶旁边异或距离为 `idx ^ 1`、`idx ^ 2`、`idx ^ 3` 的“邻居槽位”**。因为一个 `Node` 是 32 字节，相邻的 2~4 个节点正好落在同一个 **64B / 128B CPU L1 缓存行（Cache Line）** 里！这样顺着冲突链查找时，数据已经在 L1 缓存里了，几乎零内存延迟。
 
@@ -187,9 +185,9 @@ Step 2:  再搬 100 个...
 
 | 源码文件 | 核心改动说明 |
 | :--- | :--- |
-| `src/lgc.c`, `src/lgc.h` | 实现 `oldgc` / `oldfinobj` / `oldweak` 老年代隔离、`sweeptobeswept` 晋升、写屏障（`TOUCHEDBIT` + `grayagain` + `remuv`/`remudata`）以及 `startbleach` / `bleachstep` 全增量 Major GC |
+| `src/lgc.c`, `src/lgc.h` | 实现 `oldgc` / `oldfinobj` / `oldweak` 老年代隔离（含 `oldweak` 协程/弱表堆积自适应 Major 回收）、`sweeptobeswept` 晋升、写屏障（`TOUCHEDBIT` + `grayagain` + `remuv`/`remudata`）以及 `startbleach` / `bleachstep` 全增量 Major GC |
 | `src/lstate.h`, `src/lstate.c` | 在 `global_State` 内部末尾扩展老年代链表与增量漂白状态字段（完全不影响外部 C API / ABI） |
-| `src/ltable.h`, `src/ltable.c` | 实现内联 `luaH_fastgetshortstr` / `luaH_fastget`、指针优先比较、`getfreepos` 缓存行伙伴探测与 `luaH_resize` 直接插入 |
+| `src/ltable.h`, `src/ltable.c` | 实现内联 `luaH_fastgetshortstr` / `luaH_fastget`、`getfreepos` 缓存行伙伴探测与 `luaH_resize` 直接插入 |
 | `src/lvm.c`, `src/lvm.h`, `src/ltm.c`, `src/lapi.c`, `src/lundump.c` | 虚拟机查表热路径切换至内联快速入口；补齐动态设置弱表 `__mode`、老 `Proto->cache` 闭包复用及字节码反序列化时的写屏障 |
 
 ---
@@ -270,7 +268,7 @@ make clean
 - 额外的 `marked` 位（`OLDBIT`、`TOUCHEDBIT`、`TESTBIT`）与分代 GC 链表
 - 私有头文件（`lstate.h`、`lgc.h`、`lobject.h` 等）及结构体字段偏移
 
-嵌入建议：只链接 `liblua.a`（或编译 `src/*.c`）并只包含公开头文件；不要在宿主侧按内部 GC 结构体内存布局做假设。
+嵌入建议：只链接 `liblua.a`（或编译 `src/*.c`）并只包含公开头文件；不要在宿主侧按内部 GC 结构体内存布局做假设。与原生 PUC-Lua 5.3 相同，对外部不可信输入调用 `load` / `lua_load` 时请指定 `"t"` 文本模式，拒绝不受信任的预编译二进制字节码。
 
 1. 将项目中原有的 `lua-5.3.4/src` 源码目录（或编译出的 `liblua.a`）替换为 `lua53plus/src`。
 2. 重新编译即可 —— 无需修改任何 C/C++ 宿主代码、链接参数或 Lua 脚本。

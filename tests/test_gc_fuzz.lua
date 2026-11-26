@@ -498,12 +498,12 @@ local function test_gc_adversarial_edge_cases()
   io.write("  [regression: stripped undump barrier, tobeswept/tobefnz/remudata & __mode fastset] ")
   io.flush()
 
-  -- 3a. Stripped precompiled chunk with GC triggered inside lua_Reader while Proto is black & source is NULL
-  local dumped = string.dump(function(x)
-    local a = x + 1
-    return function() return a end
-  end, true)
-  for split = 28, math.min(#dumped - 1, 64) do
+  -- 3a. Stripped precompiled chunk (including >40B long string constant) with GC inside lua_Reader
+  local make_fn = assert(load(
+    'return function(x) local a = x + 1; local s = "' .. string.rep("L", 96) ..
+    '"; return function() return a, #s end end'))
+  local dumped = string.dump(make_fn(), true)
+  for split = 28, math.min(#dumped - 1, 160), 4 do
     local chunk_idx = 0
     local fn = assert(load(function()
       chunk_idx = chunk_idx + 1
@@ -514,7 +514,8 @@ local function test_gc_adversarial_edge_cases()
       end
       return nil
     end))
-    assert(fn(41)() == 42)
+    local r1, r2 = fn(41)()
+    assert(r1 == 42 and r2 == 96)
   end
 
   -- Build >4MB resident old heap so minor cycles stay minor unless needmajor is triggered
@@ -611,7 +612,12 @@ local function test_gc_adversarial_edge_cases()
     o.v = val
     mt.__mode = "v"
     val = nil
+    -- First loop finishes any cycle that already passed GCSatomic during val's
+    -- allocation; second loop runs the needmajor cycle that reclaims o.v.
     while not collectgarbage("step", 0) do end
+    if o.v ~= nil then
+      while not collectgarbage("step", 0) do end
+    end
     assert(o.v == nil)
     pad = nil
   end
@@ -636,6 +642,7 @@ local function test_gc_adversarial_edge_cases()
   end
 
   -- 3g. Finalization order when old object in oldgc is given __gc during GCSpause before incremental bleach
+  --     (both orders: old marked 1st -> young marked 2nd, and young marked 1st -> old marked 2nd)
   do
     collectgarbage("stop")
     local order = {}
@@ -648,6 +655,16 @@ local function test_gc_adversarial_edge_cases()
     A, B = nil, nil
     collectgarbage("collect")
     assert(order[1] == "B" and order[2] == "A")
+
+    order = {}
+    local C = { name = "C" }
+    while not collectgarbage("step", 200) do end
+    local D = setmetatable({ name = "D" }, gc_mt)
+    setmetatable(C, gc_mt)
+    C, D = nil, nil
+    collectgarbage("collect")
+    assert(order[1] == "C" and order[2] == "D",
+      "expected reverse-registration order C -> D, got " .. tostring(order[1]) .. " -> " .. tostring(order[2]))
     collectgarbage("restart")
   end
 

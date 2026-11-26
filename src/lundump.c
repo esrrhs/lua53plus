@@ -99,7 +99,10 @@ static TString *LoadString (LoadState *S) {
   }
   else {  /* long string */
     TString *ts = luaS_createlngstrobj(S->L, size);
+    setsvalue2s(S->L, S->L->top, ts);  /* anchor it in stack while reading */
+    luaD_inctop(S->L);
     LoadVector(S, getstr(ts), size);  /* load directly in final place */
+    S->L->top--;  /* pop anchor */
     return ts;
   }
 }
@@ -140,10 +143,14 @@ static void LoadConstants (LoadState *S, Proto *f) {
       setivalue(o, LoadInteger(S));
       break;
     case LUA_TSHRSTR:
-    case LUA_TLNGSTR:
-      setsvalue2n(S->L, o, LoadString(S));
+    case LUA_TLNGSTR: {
+      TString *ts = LoadString(S);
+      if (ts == NULL)
+        error(S, "corrupted");
+      setsvalue2n(S->L, o, ts);
       luaC_barrier(S->L, f, o);
       break;
+    }
     default:
       lua_assert(0);
     }

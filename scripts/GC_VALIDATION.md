@@ -27,11 +27,11 @@ make test-testes
 * 标记期必须保持黑→白禁令，没有 old 或 TOUCHEDBIT 总豁免。
 * 非标记期 forward barrier 对 userdata 保持黑色，但必须实际在 `remudata` 且有
   TOUCHEDBIT。Table/closure/Proto 应变灰并在 grayagain，而非黑色特批。
-* closed UpVal 不着色：仅当**这一条 UpVal** 的 inrem 与 remuv 成员身份一致时，
+* closed UpVal 不着色：仅当**这一条 UpVal** 的 `upisinrem`（`remnext != uv` 自指哨兵）与 `remuv` 成员身份一致时，
   非标记期允许其值白色；不放宽整个 closure 的 Proto 或其他 UpVal 引用。
 * sweep 按官方允许颜色不变式暂时失效。sweep 后 mainthread 被单独漂白；存活
   thread / weak table 留白并在 oldweak；因此非标记期允许指向这些**确定的目标**。
-* `checkfinalizer` 可摘除 remembered 对象、重新置黑，再强制 needmajor。仅非标记期
+* `checkfinalizer` 在非标记/非漂白期将老对象漂白挂入 `finobj`（保证逆注册析构顺序）并强制 `needmajor`。仅非标记期
   old 引用允许这个时间窗口：进入下一次标记前，pause 分支必先 bleach/merge 全部 old。
 * `inbleach && GCSpause` 时 barrier 故意不维护颜色，尚未漂白的 old 可指向白对象；
   bleach 完成后才 restartcollection，不能将这个例外扩大到标记期。
@@ -39,7 +39,7 @@ make test-testes
   bleach 清空 remembered 链但未处理的 old 暂留原颜色，故仅在 bleach 允许 touched 灰 old 脱链。
 
 故意移除 userdata barrier、清除 mandatory-major、制造无归属 pause 灰对象、破坏
-listprev、让两个 primary list 重叠、破坏 remuv inrem，均须被检查以 **SIGABRT** 拒绝；普通退出/加载失败
+listprev、让两个 primary list 重叠、破坏 remuv `upisinrem`，均须被检查以 **SIGABRT** 拒绝；普通退出/加载失败
 不是负向测试通过。故障仅由测试程序参数在一次性进程内制造，不修改生产源码。
 
 ## 2. 链表与定向回归
@@ -47,7 +47,7 @@ listprev、让两个 primary list 重叠、破坏 remuv inrem，均须被检查�
 T.checkmemory 检查 8 个 primary list（allgc / finobj / tobefnz / fixedgc / oldgc /
 oldfinobj / tobeswept / tobesweptfin）无环且两两不相交（用链尾判断，总体线性）。
 oldgc 上 Table/Udata 的 listprev 必须准确等于前驱；其他链上必须 NULL。
-remuv 无环、成员必须 closed 且 inrem；引用检查反向验证 inrem 对应实际成员。
+remuv 无环、成员必须 closed 且 `upisinrem`；引用检查反向验证 `upisinrem` 对应实际成员；`oldweak` 节点数精确等于 `oldweakcount`。
 refcount=0 的 remuv 合法：由 clearremlists 延迟释放。remudata 校验无环、类型、
 TOUCHEDBIT；正在 promotion sweep 的 userdata 可能尚非 old，不错误排除这个窗口。
 

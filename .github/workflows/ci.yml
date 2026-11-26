@@ -106,6 +106,10 @@ jobs:
         run: |
           ./src/lua tests/test_gc_fuzz.lua
 
+      - name: Run directed GC and failing-allocator OOM validation (release build)
+        run: |
+          EXTRA_CFLAGS='${{ matrix.extra_cflags }}' EXTRA_LDFLAGS='${{ matrix.extra_ldflags }}' ./scripts/run_gc_validation.sh release
+
       - name: Run official testes basic on release build
         run: |
           test -f testes/all.lua || ./scripts/fetch_testes.sh

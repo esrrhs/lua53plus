@@ -77,21 +77,37 @@
 ** 'nil'. (This is needed by 'luaV_finishget'.) Note that, if the macro
 ** returns true, there is no need to 'invalidateTMcache', because the
 ** call is not creating a new entry. If the existing key is __mode
-** (G(L)->tmname[TM_MODE]), set TM_HASMODE and needmajor when the table
-** is not white — same rule as luaH_newkey / luaV_finishset.
+** (G(L)->tmname[TM_MODE]), set needmajor when the table is not white —
+** same rule as luaH_newkey / luaV_finishset.
 */
+#define luaV_fastsetraw(L,t,k,slot,f,v) \
+  (!ttistable(t) \
+   ? (slot = NULL, 0) \
+   : (slot = f(hvalue(t), k), \
+     ttisnil(slot) ? 0 \
+     : (luaC_barrierback(L, hvalue(t), v), \
+        setobj2t(L, cast(TValue *,slot), v), \
+        1)))
+
 #define luaV_fastset(L,t,k,slot,f,v) \
   (!ttistable(t) \
    ? (slot = NULL, 0) \
    : (slot = f(hvalue(t), k), \
      ttisnil(slot) ? 0 \
-     : (l_unlikely(!iswhite(hvalue(t)) && \
-                   !((hvalue(t))->sizearray > 0 && \
-                     (hvalue(t))->array <= (slot) && \
-                     (slot) < (hvalue(t))->array + (hvalue(t))->sizearray) && \
-                   ttisshrstring(keyfromval(slot)) && \
-                   tsvalue(keyfromval(slot)) == G(L)->tmname[TM_MODE]) \
-          ? ((hvalue(t))->flags |= cast_byte(TM_HASMODE), G(L)->needmajor = 1) : 0, \
+     : (l_unlikely(ttisshrstring(k) && tsvalue(k) == G(L)->tmname[TM_MODE] && \
+                   !iswhite(hvalue(t))) \
+          ? (G(L)->needmajor = 1) : 0, \
+        luaC_barrierback(L, hvalue(t), v), \
+        setobj2t(L, cast(TValue *,slot), v), \
+        1)))
+
+#define luaV_fastsetstr(L,t,str,slot,v) \
+  (!ttistable(t) \
+   ? (slot = NULL, 0) \
+   : (slot = luaH_fastgetstr(hvalue(t), str), \
+     ttisnil(slot) ? 0 \
+     : (l_unlikely((str) == G(L)->tmname[TM_MODE] && !iswhite(hvalue(t))) \
+          ? (G(L)->needmajor = 1) : 0, \
         luaC_barrierback(L, hvalue(t), v), \
         setobj2t(L, cast(TValue *,slot), v), \
         1)))

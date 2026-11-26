@@ -108,6 +108,21 @@ static void directed(void) {
   lua_gc(L,LUA_GCCOLLECT,0); checkmem(L);
   CHECK(!G(L)->inbleach && G(L)->ismajor);
   cycle(L); CHECK(G(L)->oldgc);
+  /* Full collection while GC is stopped must preserve survivor promotion. */
+  lua_gc(L,LUA_GCSTOP,0);
+  lua_gc(L,LUA_GCCOLLECT,0); checkmem(L);
+  CHECK(G(L)->oldgc != NULL && !lua_gc(L,LUA_GCISRUNNING,0));
+  lua_gc(L,LUA_GCRESTART,0);
+  /* Excess surviving coroutines in oldweak (>256) must trigger incremental major bleach. */
+  run(L,"do local tmp={}; for i=1,300 do tmp[i]=coroutine.create(function() coroutine.yield() end); coroutine.resume(tmp[i]) end "
+        "collectgarbage('step', 5000); end");
+  checkmem(L);
+  CHECK(G(L)->oldweakcount >= 300);
+  lua_gc(L,LUA_GCSTEP,0); checkmem(L);
+  CHECK(G(L)->inbleach);
+  while (G(L)->inbleach) { lua_gc(L,LUA_GCSTEP,0); checkmem(L); }
+  state(L,GCSpause); checkmem(L);
+  CHECK(G(L)->oldweakcount < 32);
   G(L)->needmajor = 1;
   lua_gc(L,LUA_GCSTEP,0); CHECK(G(L)->inbleach);
   while (G(L)->inbleach) { lua_gc(L,LUA_GCSTEP,0); checkmem(L); }
@@ -229,7 +244,7 @@ static void corrupt(const char *kind) {
   else if (!strcmp(kind,"remuv")) {
     run(L,"local x={}; function getx() return x end; function setx(v) x=v end");
     cycle(L); run(L,"setx({})"); CHECK(G(L)->remuv);
-    G(L)->remuv->inrem=0;
+    G(L)->remuv=NULL; /* uv->remnext != uv remains true (upisinrem), breaking membership */
   }
   else if (!strcmp(kind,"pause")) {
     GCObject *o=root(L,1500); resetbit(o->marked,BLACKBIT);

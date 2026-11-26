@@ -335,6 +335,7 @@ LUA_API lua_State *lua_newstate (lua_Alloc f, void *ud) {
   g->remudata = NULL;
   g->minorcycles = 0;
   g->oldcount = g->lastmajcount = 0;
+  g->oldweakcount = g->lastmajweak = 0;
   g->lastmajbytes = 0;
   g->ismajor = 1;
   g->needmajor = 0;

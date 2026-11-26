@@ -44,9 +44,9 @@ and, when rebuilding with the T module, `EXTRA_CFLAGS` / `EXTRA_LDFLAGS`
 1. **`markgrays`**: also walks `g->grayatomic` and `g->oldweak`.
 2. **CI `_port=true`**: skip non-portable I/O assumptions.
 3. **`lua_checkmemory`**: walks `oldgc` / `oldfinobj` / `tobeswept` /
-   `tobesweptfin` / `remudata`; `checkobject` allows non-white `isold`
-   objects at `GCSpause`; `testobjref1` allows old-black → young-white
-   (TOUCHEDBIT / `oldweak` rescans). Fuzz/e2e still stress barriers.
+   `tobesweptfin` / `remudata`, verifies `remuv` (`upisinrem`) and `oldweakcount`;
+   `checkobject` allows non-white `isold` objects at `GCSpause`; `testobjref1`
+   allows only the exact phase-bounded generational reference exceptions.
 
 ## Optional: git submodule alternative
 

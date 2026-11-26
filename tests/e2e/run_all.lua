@@ -6,7 +6,8 @@
 local debug = require("debug")
 
 local src = debug.getinfo(1, "S").source
-local e2e_dir = (src:match("^@(.*)/[^/]+$") or ".")
+local is_win = (package.config:sub(1, 1) == "\\")
+local e2e_dir = (src:gsub("\\", "/"):match("^@(.*)/[^/]+$") or ".")
 local repo_root = e2e_dir:match("^(.*)/tests/e2e$") or "."
 
 package.path = e2e_dir .. "/?.lua;" .. e2e_dir .. "/?/init.lua;" .. package.path
@@ -22,9 +23,17 @@ end
 
 local function list_lua_files(dir, acc)
   acc = acc or {}
-  local p = io.popen('find "' .. dir .. '" -type f -name "*.lua" | sort')
+  local cmd = is_win
+    and ('dir /b /s "' .. dir:gsub("/", "\\") .. '\\*.lua"')
+    or ('find "' .. dir .. '" -type f -name "*.lua" | sort')
+  local p = io.popen(cmd)
   if not p then error("cannot list " .. dir) end
-  for line in p:lines() do
+  for raw in p:lines() do
+    local line = raw:gsub("\\", "/")
+    if is_win then
+      local idx = line:find(dir, 1, true)
+      if idx then line = line:sub(idx) end
+    end
     if is_test_file(line) and not line:find("/fixtures/", 1, true) then
       acc[#acc + 1] = line
     end

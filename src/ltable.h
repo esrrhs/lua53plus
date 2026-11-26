@@ -25,8 +25,7 @@
 #define wgkey(n)		(&(n)->i_key.nk)
 
 #define TM_WEAKBIT		(1u << 6)
-#define TM_HASMODE		(1u << 7)
-#define invalidateTMcache(t)	((t)->flags &= cast_byte(TM_HASMODE | TM_WEAKBIT))
+#define invalidateTMcache(t)	((t)->flags &= cast_byte(TM_WEAKBIT))
 
 
 /* true when 't' is using 'dummynode' as its hash part */
@@ -57,8 +56,8 @@ LUAI_FUNC const TValue *luaH_get (Table *t, const TValue *key);
 
 /*
 ** Inlined fast-path lookups for short strings and integer array keys.
-** Checks the primary hash bucket (or array slot) inline and falls back
-** to the out-of-line probe loop only when a collision chain exists.
+** Expands primary hash-bucket / collision-chain lookup and array-bounds
+** checks directly at VM, C API, and tag-method call sites.
 */
 static l_inline const TValue *luaH_fastgetshortstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);

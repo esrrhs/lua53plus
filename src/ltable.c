@@ -406,7 +406,7 @@ Table *luaH_new (lua_State *L) {
   GCObject *o = luaC_newobj(L, LUA_TTABLE, sizeof(Table));
   Table *t = gco2t(o);
   t->metatable = NULL;
-  t->flags = cast_byte(~(TM_HASMODE | TM_WEAKBIT));
+  t->flags = cast_byte(~TM_WEAKBIT);
   t->array = NULL;
   t->sizearray = 0;
   t->listprev = NULL;
@@ -434,8 +434,9 @@ static Node *getfreepos (Table *t, Node *mp) {
       if (ttisnil(gkey(b1))) return b1;
       if (sz > 3u) {
         Node *b2 = gnode(t, idx ^ 2u);
+        Node *b3;
         if (ttisnil(gkey(b2))) return b2;
-        Node *b3 = gnode(t, idx ^ 3u);
+        b3 = gnode(t, idx ^ 3u);
         if (ttisnil(gkey(b3))) return b3;
       }
     }
@@ -503,11 +504,9 @@ TValue *luaH_newkey (lua_State *L, Table *t, const TValue *key) {
     }
   }
   setnodekey(L, &mp->i_key, key);
-  if (ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE]) {
-    t->flags |= cast_byte(TM_HASMODE);
-    if (!iswhite(t))
-      G(L)->needmajor = 1;
-  }
+  if (l_unlikely(ttisshrstring(key) && tsvalue(key) == G(L)->tmname[TM_MODE] &&
+                 !iswhite(t)))
+    G(L)->needmajor = 1;
   luaC_barrierback(L, t, key);
   lua_assert(ttisnil(gval(mp)));
   return gval(mp);
@@ -539,8 +538,8 @@ const TValue *luaH_getint (Table *t, lua_Integer key) {
 
 /*
 ** search function for short strings
-** Unrolls the primary bucket check and compares the interned TString pointer
-** before the tag byte to minimize branch mispredictions on string tables.
+** Unrolls the primary bucket check with branch-prediction hint before
+** walking any collision chain.
 */
 const TValue *luaH_getshortstr (Table *t, TString *key) {
   Node *n = hashstr(t, key);

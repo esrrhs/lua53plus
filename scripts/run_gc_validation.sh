@@ -7,10 +7,11 @@ if [ "${1:-release}" = ltests ]; then
   flags="$flags -DGC_WITH_LTESTS -DLUA_USER_H=\"../testes/ltests/ltests.h\""
 fi
 libs="-lm"
-if [ "$(uname -s)" != Darwin ]; then libs="$libs -ldl"; fi
+default_cc="gcc"
+if [ "$(uname -s)" = Darwin ]; then default_cc="cc"; else libs="$libs -ldl"; fi
 mkdir -p validation-results
 # flag-list splitting intentional; embedded quotes in -D are literal argv bytes.
-${CC:-cc} -std=gnu99 -O2 -Wall -Wextra -Isrc $flags tests/gc_validate.c \
+${CC:-$default_cc} -std=gnu99 -O2 -Wall -Wextra -Isrc $flags tests/gc_validate.c \
   src/liblua.a ${EXTRA_LDFLAGS:-} $libs -o validation-results/gc_validate
 ./validation-results/gc_validate
 if [ "${1:-release}" = ltests ]; then
@@ -20,7 +21,7 @@ import subprocess, signal, resource
 from pathlib import Path
 resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 expected = {'barrier':'GC reference invariant failed', 'pause':'validpause', 'listprev':'listprev',
-            'mandatory-major':'GC reference invariant failed', 'primary-alias':'tails[i]', 'remuv':'inrem'}
+            'mandatory-major':'GC reference invariant failed', 'primary-alias':'tails[i]', 'remuv':'remnext'}
 for fault, assertion in expected.items():
     p = subprocess.run(['./validation-results/gc_validate',fault],stdout=subprocess.PIPE,stderr=subprocess.STDOUT)
     Path('validation-results/negative-'+fault+'.log').write_bytes(p.stdout)

@@ -35,8 +35,7 @@
 struct UpVal {
   TValue *v;  /* points to stack or to its own value */
   lu_mem refcount;  /* reference counter */
-  struct UpVal *remnext;  /* link in 'g->remuv' when closed and touched */
-  lu_byte inrem;  /* true if linked in 'g->remuv' */
+  struct UpVal *remnext;  /* link in 'g->remuv' when closed (self when out) */
   union {
     struct {  /* (when open) */
       UpVal *next;  /* linked list */
@@ -47,6 +46,7 @@ struct UpVal {
 };
 
 #define upisopen(up)	((up)->v != &(up)->u.value)
+#define upisinrem(up)	((up)->remnext != (up))
 
 
 LUAI_FUNC Proto *luaF_newproto (lua_State *L);

@@ -317,10 +317,9 @@ void luaC_upvalbarrier_ (lua_State *L, UpVal *uv) {
   if (keepinvariant(g)) {
     markobject(g, o);
   }
-  else if (!g->inbleach && iswhite(o) && !uv->inrem &&
+  else if (!g->inbleach && iswhite(o) && !upisinrem(uv) &&
            (g->oldgc != NULL || g->tobeswept != NULL ||
             g->oldfinobj != NULL || g->tobesweptfin != NULL)) {
-    uv->inrem = 1;
     uv->remnext = g->remuv;
     g->remuv = uv;
   }
@@ -445,6 +444,8 @@ static void markoldweak (global_State *g) {
     GCObject *next = *getgclist(o);
     if (g->oldcount > 0)
       g->oldcount--;
+    if (g->oldweakcount > 0)
+      g->oldweakcount--;
     if (o->tt == LUA_TTABLE)
       gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
     resetbits(o->marked, bitmask(OLDBIT) |
@@ -510,8 +511,7 @@ static void clearremlists (global_State *g, int mark) {
   while (g->remuv != NULL) {
     UpVal *uv = g->remuv;
     g->remuv = uv->remnext;
-    uv->remnext = NULL;
-    uv->inrem = 0;
+    uv->remnext = uv;
     if (uv->refcount == 0)
       luaM_free(g->mainthread, uv);
     else if (mark)
@@ -540,6 +540,7 @@ static void startbleach (global_State *g) {
   g->grayagain = NULL;
   g->grayatomic = NULL;
   g->oldweak = NULL;
+  g->oldweakcount = 0;
   clearremlists(g, 0);
   for (p = &g->finobj; *p != NULL; p = &(*p)->next) {
     curr = *p;
@@ -615,6 +616,7 @@ static void mergeoldgen (global_State *g) {
   g->grayagain = NULL;
   g->grayatomic = NULL;
   g->oldweak = NULL;
+  g->oldweakcount = 0;
   clearremlists(g, 0);
   for (p = &g->allgc; *p != NULL; p = &(*p)->next) {
     GCObject *curr = *p;
@@ -1043,7 +1045,7 @@ void luaC_upvdeccount (lua_State *L, UpVal *uv) {
   lua_assert(uv->refcount > 0);
   uv->refcount--;
   if (uv->refcount == 0 && !upisopen(uv)) {
-    if (uv->inrem)
+    if (upisinrem(uv))
       setnilvalue(uv->v);
     else
       luaM_free(L, uv);
@@ -1165,6 +1167,7 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
       g->allgc = curr;
       linkgclist(gco2th(curr), g->oldweak);
       g->oldcount++;
+      g->oldweakcount++;
     }
     else if (curr->tt == LUA_TTABLE && (gco2t(curr)->flags & TM_WEAKBIT)) {
       gco2t(curr)->flags &= cast_byte(~TM_WEAKBIT);
@@ -1175,6 +1178,7 @@ static GCObject **sweeptobeswept (lua_State *L, GCObject **p, lu_mem count) {
       g->allgc = curr;
       linkgclist(gco2t(curr), g->oldweak);
       g->oldcount++;
+      g->oldweakcount++;
     }
 
     else {
@@ -1416,32 +1420,18 @@ void luaC_checkfinalizer (lua_State *L, GCObject *o, Table *mt) {
           }
           if (o->tt == LUA_TTABLE)
             gco2t(o)->flags &= cast_byte(~TM_WEAKBIT);
+          o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
+                      bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
+                      bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
           if (g->inbleach) {
-            o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                        bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
-                        bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
             if (g->finobj == NULL)
               g->fintail = &o->next;
-            o->next = g->finobj;
-            g->finobj = o;
-          }
-          else if (g->tobesweptfin != NULL) {
-            o->marked = cast_byte((o->marked & ~(bitmask(BLACKBIT) | WHITEBITS |
-                        bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
-                        bitmask(TESTBIT))) | luaC_white(g) | bitmask(FINALIZEDBIT));
-            o->next = g->finobj;
-            g->finobj = o;
-            g->needmajor = 1;
           }
           else {
-            o->marked = cast_byte((o->marked & ~(WHITEBITS |
-                        bitmask(TOUCHEDBIT) | bitmask(TESTBIT))) |
-                        bitmask(BLACKBIT) | bitmask(OLDBIT) | bitmask(FINALIZEDBIT));
-            o->next = g->oldfinobj;
-            g->oldfinobj = o;
-            g->oldcount++;
             g->needmajor = 1;
           }
+          o->next = g->finobj;
+          g->finobj = o;
         }
         return;
       }
@@ -1547,6 +1537,9 @@ static void setpause (global_State *g) {
 ** not need to skip objects created between "now" and the start of the
 ** real sweep.
 */
+#define shouldpromote(g) \
+  ((g)->infullgc == 2 || (!(g)->infullgc && (g)->gcrunning))
+
 static void entersweep (lua_State *L) {
   global_State *g = G(L);
   GCObject *o;
@@ -1560,7 +1553,7 @@ static void entersweep (lua_State *L) {
                 bitmask(OLDBIT) | bitmask(TOUCHEDBIT) |
                 bitmask(TESTBIT))) | white);
   }
-  if (!g->infullgc && g->gcrunning) {
+  if (shouldpromote(g)) {
     g->tobeswept = g->allgc;
     g->allgc = NULL;
     g->tobesweptfin = g->finobj;
@@ -1702,7 +1695,9 @@ static lu_mem singlestep (lua_State *L) {
           (totalbytes < 512 * 1024 && g->minorcycles >= 1) ||
           (g->minorcycles >= 8) ||
           (g->lastmajbytes > 0 && totalbytes > g->lastmajbytes + (g->lastmajbytes / 3)) ||
-          (g->lastmajcount > 0 && g->oldcount > g->lastmajcount + (g->lastmajcount >> 2))) {
+          (g->lastmajcount > 0 && g->oldcount > g->lastmajcount + (g->lastmajcount >> 2)) ||
+          (g->oldweakcount > g->lastmajweak + 256 &&
+           g->oldweakcount > (g->lastmajweak << 1))) {
         if (!g->infullgc && g->gcrunning &&
             (g->oldgc != NULL || g->oldfinobj != NULL)) {
           startbleach(g);
@@ -1748,7 +1743,7 @@ static lu_mem singlestep (lua_State *L) {
     }
     case GCSswpallgc: {  /* sweep "regular" objects */
       GCObject **nextlist = (g->tobesweptfin != NULL) ? &g->tobesweptfin :
-                            (!g->infullgc && g->gcrunning) ? NULL : &g->finobj;
+                            shouldpromote(g) ? NULL : &g->finobj;
       return sweepstep(L, g, GCSswpfinobj, nextlist);
     }
     case GCSswpfinobj: {  /* sweep objects with finalizers */
@@ -1760,10 +1755,11 @@ static lu_mem singlestep (lua_State *L) {
     case GCSswpend: {  /* finish sweeps */
       makewhite(g, g->mainthread);  /* sweep main thread */
       checkSizes(L, g);
-      if (!g->infullgc) {
+      if (g->infullgc != 1) {
         lu_mem livebytes = g->GCestimate;
         if (g->ismajor || g->lastmajbytes == 0) {
           g->lastmajcount = g->oldcount;
+          g->lastmajweak = g->oldweakcount;
           g->lastmajbytes = livebytes;
         }
         else if (livebytes > g->lastmajbytes + (g->lastmajbytes / 5)) {
@@ -1832,10 +1828,11 @@ void luaC_cleartestgray (global_State *g) {
 
 void luaC_step (lua_State *L) {
   global_State *g = G(L);
+  l_mem debt;
 #if defined(LUA_DEBUG)
   luaC_cleartestgray(g);
 #endif
-  l_mem debt = getdebt(g);  /* GC deficit (be paid now) */
+  debt = getdebt(g);  /* GC deficit (be paid now) */
   if (!g->gcrunning) {  /* not running? */
     luaE_setdebt(g, -GCSTEPSIZE * 10);  /* avoid being called too often */
     return;
@@ -1881,7 +1878,8 @@ void luaC_fullgc (lua_State *L, int isemergency) {
   }
   /* finish any pending sweep phase to start a new cycle */
   luaC_runtilstate(L, bitmask(GCSpause));
-  g->infullgc = isemergency ? 1 : 0;
+  g->infullgc = isemergency ? 1 :
+                (g->gcrunning || gettotalbytes(g) >= 512 * 1024) ? 2 : 0;
   mergeoldgen(g);
   luaC_runtilstate(L, ~bitmask(GCSpause));  /* start new collection */
   luaC_runtilstate(L, bitmask(GCScallfin));  /* run up to finalizers */

@@ -128,7 +128,7 @@ Yes! That is why every generational collector periodically runs a **Major GC (Fu
 
 #### 1. When does `lua53plus` trigger a Major GC?
 - When post-sweep live heap bytes grow by more than **20%** (`GCestimate > lastmajbytes * 1.20`) or pre-GC total bytes exceed **1.33x** of `lastmajbytes`;
-- When the number of promoted old objects grows by more than **25%** since the last Major GC (`oldcount > lastmajcount * 1.25`), or after every **8 consecutive Minor GC cycles** (`minorcycles >= 8`) to guarantee dead old objects from temporary ramp-up peaks are promptly reclaimed;
+- When the number of promoted old objects grows by more than **25%** since the last Major GC (`oldcount > lastmajcount * 1.25`), when accumulated surviving coroutines/weak tables in `oldweak` exceed `lastmajweak + 256` and `2x` baseline, or after every **8 consecutive Minor GC cycles** (`minorcycles >= 8`) to guarantee dead old objects from temporary ramp-up peaks are promptly reclaimed;
 - When the user explicitly calls `collectgarbage("collect")`, or when a weak-mode metatable (`__mode`) is dynamically attached to a non-white table (`needmajor = 1`).
 
 #### 2. Why Lua 5.4's Generational GC (`KGC_GEN`) Still Spikes on Large Heaps
@@ -165,10 +165,9 @@ Every phase of a Major GC is sliced into tiny microsecond steps:
 Once GC overhead is eliminated, CPU profiling shows that the next largest hotspot in Lua is **string-keyed table lookups** (`t.field`, `t["key"]`, `obj:method()`). `lua53plus` speeds this up in three ways:
 
 1. **Header-Inlined Fast-Path (`luaH_fastgetshortstr`, `luaH_fastget`)**:
-   Inlines short-string hash lookup and integer array-bounds checks directly into `lvm.c`, `lapi.c`, and `ltm.c`, eliminating cross-translation-unit call overhead in `luaV_execute`.
-2. **Pointer-First Interned Short-String Comparison**:
-   In Lua 5.3, all short strings (<= 40 bytes, `LUA_TSHRSTR`) are uniquely interned in the global string table—two equal short strings always have the exact same `TString*` pointer.
-   Standard Lua checks the node's type tag `ttisshrstring(k)` first and compares the pointer second. `lua53plus` **compares the 64-bit pointer `val_(k).gc == obj2gco(key)` first** and verifies `ttisshrstring(k)` second, rejecting non-matching keys in a single register comparison with minimal branch mispredictions.
+   Inlines interned short-string hash lookup (with `l_likely` primary-bucket prediction) and integer array-bounds checks directly into `lvm.c`, `lapi.c`, and `ltm.c`, eliminating cross-translation-unit call overhead in `luaV_execute`.
+2. **Direct Unique Insertion on Rehash (`luaH_resize`)**:
+   When resizing a table's hash part, `lua53plus` inserts existing unique hash entries directly via `luaH_newkey` (or into the grown array slice) without performing a redundant `luaH_get` lookup on the fresh node array.
 3. **Cache-Line Buddy Probing (`getfreepos`)**:
    When a hash collision occurs in `luaH_newkey`, standard Lua scans backward from the end of the table (`lastfree`), scattering colliding nodes across distant memory addresses. `lua53plus` first probes buddy slots (`idx ^ 1`, `idx ^ 2`, `idx ^ 3`) within the same **64B / 128B CPU L1 cache line**, keeping collision chains cache-local.
 
@@ -250,7 +249,7 @@ This produces:
 - Extra `marked` bits (`OLDBIT`, `TOUCHEDBIT`, `TESTBIT`) and generational GC lists
 - Private headers (`lstate.h`, `lgc.h`, `lobject.h`, …) and struct field offsets
 
-Embedding guidance: link `liblua.a` (or compile `src/*.c`) and include only the public headers. Do not memcpy or reinterpret internal GC structs from host code.
+Embedding guidance: link `liblua.a` (or compile `src/*.c`) and include only the public headers. Do not memcpy or reinterpret internal GC structs from host code. As in upstream PUC-Lua 5.3, pass mode `"t"` to `load` / `lua_load` when loading untrusted external scripts so arbitrary precompiled binary chunks are rejected.
 
 1. Replace your project's `lua-5.3.4/src` directory (or `liblua.a`) with `lua53plus/src`.
 2. Recompile — no changes to your C/C++ host code, linker flags, or Lua scripts are required.

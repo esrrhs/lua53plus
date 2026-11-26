@@ -163,10 +163,12 @@ typedef struct global_State {
   unsigned int minorcycles;  /* consecutive minor cycles since last major GC */
   lu_mem oldcount;  /* number of promoted objects in old generation */
   lu_mem lastmajcount;  /* 'oldcount' after last major GC */
+  lu_mem oldweakcount;  /* number of surviving threads/weak tables in 'oldweak' */
+  lu_mem lastmajweak;  /* 'oldweakcount' after last major GC */
   lu_mem lastmajbytes;  /* live bytes after last major GC */
   lu_byte ismajor;  /* true if current cycle is a major GC */
   lu_byte needmajor;  /* true if next cycle must be a major GC */
-  lu_byte infullgc;  /* true if inside luaC_fullgc */
+  lu_byte infullgc;  /* 1: non-promoting full/abort sweep; 2: promoting fullgc */
   lu_byte inbleach;  /* true if incrementally bleaching oldgen in GCSpause */
   lu_byte drainedgray;  /* number of incremental grayagain drains in propagate */
 } global_State;

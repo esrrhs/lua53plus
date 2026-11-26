@@ -52,7 +52,7 @@ fi
 
 # Baseline options: errors must fail the process. Leak detection is
 # conditioned above; macOS does not provide a usable LSan.
-export ASAN_OPTIONS="detect_leaks=${DETECT_LEAKS}:halt_on_error=1:detect_stack_use_after_return=1"
+export ASAN_OPTIONS="detect_leaks=${DETECT_LEAKS}:halt_on_error=1:detect_stack_use_after_return=1${ASAN_EXTRA_OPTIONS:+:$ASAN_EXTRA_OPTIONS}"
 export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
 export FUZZ_OPS
 export FUZZ_REQUIRE_UDATA=1
