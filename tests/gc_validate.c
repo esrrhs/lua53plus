@@ -419,6 +419,105 @@ static void coverage_edges(void) {
     checkmem(L);
     closecheck(L, &a);
   }
+
+  /* 7. sweeptobeswept non-black Proto cache, udata2finalize with sweepgc
+        still on the tobefnz head, and checkfinalizer of an old object
+        while bleach has not yet grown finobj. */
+  {
+    Alloc a = {0};
+    lua_State *L = lua_newstate(allocf, &a);
+    GCObject *o, *cache, **pp;
+    Proto *f;
+    lu_byte cachemark;
+    CHECK(L);
+    luaL_openlibs(L);
+
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    lua_gc(L, LUA_GCSTOP, 0);
+    run(L, "hold = function() local a = 1; return function() return a end end; "
+           "c = hold(); pad = {}");
+    lua_gc(L, LUA_GCRESTART, 0);
+    CHECK(lua_gc(L, LUA_GCISRUNNING, 0));
+    state(L, GCSswpallgc);
+    CHECK(G(L)->tobeswept && G(L)->sweepgc == &G(L)->tobeswept);
+    f = NULL;
+    for (o = G(L)->tobeswept; o != NULL; o = o->next) {
+      if (o->tt == LUA_TPROTO && gco2p(o)->cache != NULL) {
+        f = gco2p(o);
+        break;
+      }
+    }
+    CHECK(f);
+    cache = obj2gco(f->cache);
+    cachemark = cache->marked;
+    resetbit(cache->marked, BLACKBIT);
+    CHECK(!isblack(cache) && !isdead(G(L), cache));
+    for (pp = &G(L)->tobeswept; *pp != obj2gco(f); pp = &(*pp)->next)
+      CHECK(*pp != NULL);
+    *pp = obj2gco(f)->next;
+    obj2gco(f)->next = G(L)->tobeswept;
+    G(L)->tobeswept = obj2gco(f);
+    lua_gc(L, LUA_GCSTEP, 0);
+    CHECK(f->cache == NULL);
+    if (!isblack(cache))
+      cache->marked = cachemark;
+    state(L, GCSpause);
+    checkmem(L);
+
+    lua_gc(L, LUA_GCSTOP, 0);
+    run(L, "nfin7 = 0; mt7 = { __gc = function() nfin7 = nfin7 + 1 end }; "
+           "for i = 1, 3 do setmetatable({}, mt7) end");
+    lua_gc(L, LUA_GCRESTART, 0);
+    state(L, GCSswptobefnz);
+    CHECK(G(L)->tobefnz && tofinalize(G(L)->tobefnz));
+    G(L)->sweepgc = &G(L)->tobefnz->next;
+    G(L)->gcstate = GCScallfin;
+    lua_gc(L, LUA_GCSTEP, 0);
+    run(L, "assert(nfin7 >= 1)");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    checkmem(L);
+    closecheck(L, &a);
+
+    /* base only: the io library's stdio userdata would already occupy oldfinobj */
+    L = lua_newstate(allocf, &a);
+    CHECK(L);
+    lua_pushcfunction(L, luaopen_base);
+    lua_call(L, 0, 0);
+    run(L, "uds = {}; for i = 1, 2000 do uds[i] = {} end; "
+           "gcmt = { __gc = function() end }");
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    CHECK(G(L)->oldgc && G(L)->finobj == NULL && G(L)->oldfinobj == NULL);
+    G(L)->needmajor = 1;
+    lua_gc(L, LUA_GCSTEP, 0);
+    CHECK(G(L)->inbleach && G(L)->finobj == NULL && G(L)->oldgc);
+    lua_getglobal(L, "uds");
+    {
+      Table *uds = hvalue(L->top - 1);
+      unsigned i;
+      o = NULL;
+      for (i = 0; i < uds->sizearray; i++) {
+        if (ttistable(&uds->array[i]) && isold(gcvalue(&uds->array[i]))) {
+          o = gcvalue(&uds->array[i]);
+          break;
+        }
+      }
+    }
+    lua_pop(L, 1);
+    CHECK(o && isold(o) && !tofinalize(o));
+    lua_lock(L);
+    sethvalue(L, L->top, gco2t(o));
+    L->top++;
+    lua_unlock(L);
+    lua_getglobal(L, "gcmt");
+    lua_setmetatable(L, -2);
+    lua_pop(L, 1);
+    CHECK(G(L)->inbleach && G(L)->finobj == o && G(L)->fintail == &o->next);
+    while (G(L)->inbleach)
+      lua_gc(L, LUA_GCSTEP, 0);
+    lua_gc(L, LUA_GCCOLLECT, 0);
+    checkmem(L);
+    closecheck(L, &a);
+  }
   puts("coverage_edges: remudata / mid-sweep close / 0-clear oldweak / 24MB pause / proto cache OK");
 }
 
